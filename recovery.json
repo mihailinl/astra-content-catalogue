@@ -1,0 +1,5 @@
+{
+  "$comment": "Pairs on the data branch that the signer builds on although they do not verify under the kind's keys in trust.json. Empty unless an administrator is following README, \"When a kind cannot be signed over what data holds\". An entry names one exact pair by the SHA-256 of its two files and stops mattering as soon as the kind is signed again.",
+  "schema": "astra.content.signer-recovery/1",
+  "accept": []
+}

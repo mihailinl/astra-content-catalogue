@@ -3,40 +3,52 @@
 #
 # Sign the content documents of the five kinds (README, "The flow").
 #
-#   work   asks the plugins service for each kind's entries and withdrawn
-#          rows (bin/fetch.mjs) and hands the answers on as an artifact.
-#          Environment `content-service`: an OIDC token whose audience the
-#          service pins, and NO secret. A kind whose door is not open (HTTP
-#          404, or `unavailable`) is left alone, quietly, if it has never
-#          been published or was signed within the last twelve hours; a
-#          published kind left longer than that fails the run.
-#   sign   one leg per kind, one after another. Each leg runs in that kind's
-#          own environment, `publish-<kind>`, which holds that kind's one
-#          key, and has NO OIDC token. A leg is five steps:
-#            open the `data` branch        token, no key
-#            prepare (bin/prepare.mjs)     no key, no token: reads the answer,
-#                                          runs the specification's checker,
-#                                          writes the unsigned bodies
-#            sign (bin/sign.mjs)           THE KEY: one Node file that starts
-#                                          no process and opens no connection
-#            verify (bin/verify.mjs)       no key, no token: proves what was
-#                                          signed, then installs it
-#            publish                       token, no key: moves `data` forward
+# Four jobs, each on a runner of its own. For one kind:
 #
-# So the job that reads bytes the service chose holds no key; a job that
-# holds a key cannot speak to the service and holds no other kind's key; and
-# inside a leg, the code that parses those bytes never runs in the step that
-# has the key. A leg's environment and secret are spelt out in the matrix
-# below, one line each, and test/workflows.test.mjs holds that table to
-# lib/kinds.mjs.
+#   work      asks the plugins service for each kind's entries and withdrawn
+#             rows (bin/fetch.mjs), checks every answer, and hands on only the
+#             answers that passed. Environment `content-service`: an OIDC
+#             token whose audience the service pins, and NO secret. A kind
+#             whose door is not open (HTTP 404, or `unavailable`) is left
+#             alone, quietly, if it has never been published or was signed
+#             within the last twelve hours; a published kind left longer than
+#             that fails the run.
+#   prepare   one leg per kind. No key, no environment, a token that can only
+#             read. Reads the answer and the kind's last signed pair on
+#             `data`, runs the specification's checker, and uploads the
+#             prepared artifact: the two UNSIGNED bodies, an order, and the
+#             trust.json it used.
+#   sign      one leg per kind, in that kind's own environment
+#             `publish-<kind>`, which holds that kind's one key. THE KEY JOB.
+#             Its token has no permission at all (`permissions: {}`): it
+#             cannot write this repository, and it cannot mint an OIDC token.
+#             It does three things and nothing else: a fresh checkout of this
+#             commit, a download of its kind's prepared artifact, and ONE Node
+#             command (bin/sign.mjs) that starts no process and opens no
+#             connection. It uploads the signed artifact. It runs no Python,
+#             no git of its own, no setup action, and nothing an earlier job
+#             could have changed: the runner is new, the checkout is new, and
+#             the artifact is admitted file by file before it is read.
+#   publish   one leg per kind, one after another. No key. Proves that what
+#             was signed is what was prepared and that it verifies, then
+#             moves `data` forward (bin/verify.mjs, bin/data.mjs).
 #
-# A leg's token can write this repository's contents, and GitHub cannot limit
-# a token to one branch. What keeps a leg from changing the code on `main`
-# that the next run would execute is the ruleset on `main` (owner/create.sh):
-# only an administrator updates it.
+# What crosses from one job to the next is an artifact and nothing else. A
+# job's environment and PATH are its own: GITHUB_ENV and GITHUB_PATH are
+# files on one runner and end with its job, and this workflow writes neither.
+# No job output is read by the key job's steps.
+#
+# A leg's environment and secret are spelt out in the `sign` matrix below, one
+# line each, and test/workflows.test.mjs holds that table to lib/kinds.mjs.
+#
+# The `publish` legs' token can write this repository's contents, and GitHub
+# cannot limit a token to one branch. What keeps it from changing the code on
+# `main` that the next run would execute is the ruleset on `main`
+# (owner/create.sh): only an administrator updates it.
 #
 # The legs do not stop one another: a kind that cannot be signed fails its own
-# leg and keeps its last signed pair, and the others go on.
+# leg and keeps its last signed pair, and the others go on. Only the publish
+# legs run one at a time, because each pushes `data`.
 
 name: Sign
 
@@ -64,10 +76,10 @@ jobs:
     outputs:
       todo: ${{ steps.fetch.outputs.todo }}
     steps:
-      - name: Check out the signer (main)
+      - name: Check out the signer (this commit)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -79,11 +91,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: node bin/data.mjs open --dir "$RUNNER_TEMP/data"
 
-      - name: Ask the service for each kind
+      - name: Ask the service for each kind, and check each answer
         id: fetch
         run: node bin/fetch.mjs --out "$RUNNER_TEMP/exports" --data "$RUNNER_TEMP/data"
 
-      - name: Hand the answers to the signing legs
+      - name: Hand the checked answers to the preparing legs
         if: steps.fetch.outputs.todo == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -92,21 +104,83 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Fail when a call was refused or a published kind is overdue
+      - name: Fail when a call or an answer was refused, or a published kind is overdue
         if: steps.fetch.outputs.failed == 'true'
         run: |
-          echo "A call was refused, or a published kind has not been signed for over twelve hours; see the step above. The kinds that were answered are still signed."
+          echo "A call or an answer was refused, or a published kind has not been signed for over twelve hours; see the step above. The kinds that were answered are still signed."
           exit 1
 
-  sign:
-    name: Sign ${{ matrix.kind }}
+  prepare:
+    name: Prepare ${{ matrix.kind }}
     needs: work
     if: ${{ !cancelled() && needs.work.outputs.todo == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
-      max-parallel: 1
+      matrix:
+        kind: [commands, characters, models, animsets, packs]
+    permissions:
+      contents: read
+    env:
+      KIND: ${{ matrix.kind }}
+    steps:
+      - name: Check out the signer (this commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out the published trust.json (astra-registry; verified under the compiled roots)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mihailinl/astra-registry
+          ref: main
+          path: registry-trust
+          sparse-checkout: registry/v1/trust.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Take the checked answers from the work job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: content-exports
+          path: ${{ runner.temp }}/exports
+
+      - name: Open the data branch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node bin/data.mjs open --dir "$RUNNER_TEMP/data"
+
+      - name: Prepare the kind
+        run: >-
+          node bin/prepare.mjs --kind "$KIND"
+          --exports "$RUNNER_TEMP/exports"
+          --data "$RUNNER_TEMP/data"
+          --trust registry-trust/registry/v1/trust.json
+          --work "$RUNNER_TEMP/prepared"
+
+      - name: Hand the prepared bodies to the key job
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prepared-${{ matrix.kind }}
+          path: ${{ runner.temp }}/prepared
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign ${{ matrix.kind }}
+    needs: prepare
+    if: ${{ !cancelled() && needs.prepare.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
       matrix:
         include:
           - kind: commands
@@ -125,15 +199,56 @@ jobs:
             environment: publish-packs
             secret: ASTRA_PACKS_SIGNING_KEY
     environment: ${{ matrix.environment }}
+    permissions: {}
+    env:
+      KIND: ${{ matrix.kind }}
+    steps:
+      - name: Check out the signer (this commit, afresh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Take the kind's prepared bodies
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: prepared-${{ matrix.kind }}
+          path: ${{ runner.temp }}/prepared
+
+      - name: Sign the kind (the key)
+        env:
+          CONTENT_SIGNING_KEY: ${{ secrets[matrix.secret] }}
+        run: node bin/sign.mjs --kind "$KIND" --work "$RUNNER_TEMP/prepared" --out "$RUNNER_TEMP/signed"
+
+      - name: Hand the signed documents to the publishing job
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-${{ matrix.kind }}
+          path: ${{ runner.temp }}/signed
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Verify and publish ${{ matrix.kind }}
+    needs: [prepare, sign]
+    if: ${{ !cancelled() && needs.sign.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        kind: [commands, characters, models, animsets, packs]
     permissions:
       contents: write
     env:
       KIND: ${{ matrix.kind }}
     steps:
-      - name: Check out the signer (main)
+      - name: Check out the signer (this commit)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Check out the published trust.json (astra-registry; verified under the compiled roots)
@@ -150,38 +265,32 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Take the answers from the work job
+      - name: Take what was prepared
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: content-exports
-          path: ${{ runner.temp }}/exports
+          name: prepared-${{ matrix.kind }}
+          path: ${{ runner.temp }}/prepared
+
+      - name: Take what was signed
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed-${{ matrix.kind }}
+          path: ${{ runner.temp }}/signed
 
       - name: Open the data branch
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node bin/data.mjs open --dir "$RUNNER_TEMP/data"
 
-      - name: Prepare the kind (no key)
-        run: >-
-          node bin/prepare.mjs --kind "$KIND"
-          --exports "$RUNNER_TEMP/exports"
-          --data "$RUNNER_TEMP/data"
-          --trust registry-trust/registry/v1/trust.json
-          --work "$RUNNER_TEMP/work"
-
-      - name: Sign the kind (the key)
-        env:
-          CONTENT_SIGNING_KEY: ${{ secrets[matrix.secret] }}
-        run: node bin/sign.mjs --kind "$KIND" --trust registry-trust/registry/v1/trust.json --work "$RUNNER_TEMP/work"
-
-      - name: Verify what was signed (no key)
+      - name: Verify what was signed
         run: >-
           node bin/verify.mjs --kind "$KIND"
+          --work "$RUNNER_TEMP/prepared"
+          --signed "$RUNNER_TEMP/signed"
           --data "$RUNNER_TEMP/data"
           --trust registry-trust/registry/v1/trust.json
-          --work "$RUNNER_TEMP/work"
 
       - name: Move data forward, then fail if a withdrawn row had to be kept
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: node bin/data.mjs publish --dir "$RUNNER_TEMP/data" --work "$RUNNER_TEMP/work"
+        run: node bin/data.mjs publish --dir "$RUNNER_TEMP/data" --signed "$RUNNER_TEMP/signed"

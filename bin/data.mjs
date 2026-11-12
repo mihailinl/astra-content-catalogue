@@ -7,10 +7,10 @@
 //
 //   node bin/data.mjs open    --dir <dir> [--remote <url>]
 //       check out the `data` branch into <dir>, or start it. Used by the
-//       `work` job (to see when each kind was last signed) and as the first
-//       step of a signing leg.
-//   node bin/data.mjs publish --dir <dir> --work <dir>
-//       the last step of a signing leg: commit what bin/verify.mjs installed
+//       `work` job (to see when each kind was last signed), by the preparing
+//       job (to read the last pair) and by the publishing job.
+//   node bin/data.mjs publish --dir <dir> --signed <dir>
+//       the last step of the publishing job: commit what bin/verify.mjs installed
 //       and move `data` forward, then exit 1 if the signed withdrawn document
 //       keeps a row that the service's answer omitted. Publishing comes first
 //       on purpose: the kept row must reach clients, and the failed run is
@@ -51,8 +51,8 @@ function run(argv, { env = process.env, log = console.log } = {}) {
     return 0;
   }
   if (mode === "publish") {
-    const args = parseArgs(rest, ["dir", "work"]);
-    const report = JSON.parse(fs.readFileSync(path.join(args.work, "report.json"), "utf8"));
+    const args = parseArgs(rest, ["dir", "signed"]);
+    const report = JSON.parse(fs.readFileSync(path.join(args.signed, "report.json"), "utf8"));
     if (report.outcome === "signed") {
       const r = publishData({ dir: args.dir, message: `sign ${report.kind}: issued_at ${report.issued_at} under ${report.key_id}`, token });
       log(r.pushed ? `data moved forward to ${r.head}` : "nothing to publish");
@@ -68,7 +68,7 @@ function run(argv, { env = process.env, log = console.log } = {}) {
     }
     return 0;
   }
-  throw new Error("usage: node bin/data.mjs open|publish --dir <dir> [--work <dir>] [--remote <url>]");
+  throw new Error("usage: node bin/data.mjs open|publish --dir <dir> [--signed <dir>] [--remote <url>]");
 }
 
 if (isMain(import.meta)) runAsCommand(main);

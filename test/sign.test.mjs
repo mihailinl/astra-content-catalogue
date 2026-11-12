@@ -14,6 +14,7 @@ import { jcs } from "../vendor/astra-registry/tools/lib/canonical.mjs";
 import { carryRows, lifts } from "../lib/carry.mjs";
 import { checkDocument } from "../lib/checker.mjs";
 import { prepareKind } from "../lib/pipeline.mjs";
+import { loadRecovery } from "../lib/recovery.mjs";
 import { DOCS, documentPath, EXPORT_MAX_AGE, EXPORT_MAX_AHEAD, KINDS, MAX_DOCUMENT_BYTES, MAX_EXPORT_BYTES, Refused, RESIGN_AFTER, statePath } from "../lib/kinds.mjs";
 import { exportOf, golden, GOLDENS, goldenTrust, iso, NOW, plant, scratch, seedSecret, signKind, snapshot, testSeed, throwawayTrust, writeExport } from "./helpers.mjs";
 
@@ -29,7 +30,7 @@ function run(t, o) {
   // an answer is generated when it is asked for, unless the test is about its age
   const answer = o.export && !o.keepTime ? { ...o.export, generated_at: iso(now) } : o.export;
   const exportFile = writeExport(dir, o.kind, answer, { raw: o.raw ?? null });
-  return signKind({ kind: o.kind, exportFile, dataDir, trust: o.trust, secret: o.secret, now, tmpDir: dir, ...("everHeld" in o ? { everHeld: o.everHeld } : {}), verify: o.verify, check: o.check });
+  return signKind({ kind: o.kind, exportFile, dataDir, trust: o.trust, secret: o.secret, now, tmpDir: dir, ...("everHeld" in o ? { everHeld: o.everHeld } : {}), accepted: o.accepted ?? [], verify: o.verify, check: o.check });
 }
 
 test("a golden round trip: the signer reproduces every valid golden, and the vendored verifier accepts it", (t) => {
@@ -475,6 +476,41 @@ test("what is on the data branch is proven before anything is built on it", (t) 
   const base = { dir, dataDir: path.join(dir, "data"), kind: "characters", trust, secret };
   assert.equal(run(t, { ...base, export: exportOf("characters", { rows }), now: NOW, everHeld: false }).outcome, "signed");
   assert.equal(run(t, { ...base, export: exportOf("characters"), now: NOW + 60 }).carried, rows.length);
+});
+
+test("a pair nothing verifies is built on only when an administrator has named it", (t) => {
+  const sha = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  const before = throwawayTrust();
+  const after = throwawayTrust({ suffixes: ["c", "d"] }); // a ceremony that replaced both keys of every kind
+  const rows = golden("withdrawn/characters/valid.json").signed.rows;
+  const dir = scratch(t);
+  const dataDir = path.join(dir, "data");
+  run(t, { dir, dataDir, kind: "characters", trust: before.trust, secret: seedSecret(before.seeds.characters.current), export: exportOf("characters", { rows }), now: NOW });
+  const base = { dir, dataDir, kind: "characters", trust: after.trust, secret: seedSecret(after.seeds.characters.current), export: exportOf("characters"), now: NOW + 3600 };
+  const pair = { kind: "characters", index_sha256: sha(path.join(dataDir, documentPath("characters", "index"))), withdrawn_sha256: sha(path.join(dataDir, documentPath("characters", "withdrawn"))) };
+
+  assert.throws(() => run(t, base), refusal("E_PREVIOUS_UNVERIFIED"));
+  // an entry for other bytes, or for another kind, accepts nothing
+  assert.throws(() => run(t, { ...base, accepted: [{ ...pair, withdrawn_sha256: "0".repeat(64) }] }), refusal("E_PREVIOUS_UNVERIFIED"));
+  assert.throws(() => run(t, { ...base, accepted: [{ ...pair, index_sha256: pair.withdrawn_sha256 }] }), refusal("E_PREVIOUS_UNVERIFIED"));
+  assert.throws(() => run(t, { ...base, accepted: [{ ...pair, kind: "models" }] }), refusal("E_PREVIOUS_UNVERIFIED"));
+  // the named pair is built on: its rows are kept (the answer omits them), its serial is the floor
+  assert.throws(() => run(t, { ...base, accepted: [pair], now: NOW }), refusal("E_SERIAL_BACK"));
+  const report = run(t, { ...base, accepted: [pair] });
+  assert.deepEqual({ outcome: report.outcome, carried: report.carried, key_id: report.key_id }, { outcome: "signed", carried: rows.length, key_id: "astra-characters-testc" });
+  assert.deepEqual(read(dataDir, "characters", "withdrawn").signed.rows, rows, "nothing is lost");
+  // from then on the pair verifies, and the entry matches nothing
+  assert.equal(run(t, { ...base, accepted: [], export: exportOf("characters", { rows, state: "c".repeat(64) }), now: NOW + 7200 }).carried, 0);
+
+  // recovery.json as shipped accepts nothing, and a file that is not a recovery list is a refusal, not an empty list
+  assert.deepEqual(loadRecovery(), []);
+  const file = path.join(dir, "recovery.json");
+  for (const bad of ["{", '{"schema":"astra.content.signer-recovery/1"}', '{"schema":"x","accept":[]}', JSON.stringify({ schema: "astra.content.signer-recovery/1", accept: [{ kind: "games", index_sha256: "0".repeat(64), withdrawn_sha256: "0".repeat(64) }] }), JSON.stringify({ schema: "astra.content.signer-recovery/1", accept: [{ kind: "packs", index_sha256: "zz" }] })]) {
+    fs.writeFileSync(file, bad);
+    assert.throws(() => loadRecovery(file), refusal("E_RECOVERY"));
+  }
+  fs.writeFileSync(file, JSON.stringify({ schema: "astra.content.signer-recovery/1", accept: [{ ...pair, reason: "ceremony" }] }));
+  assert.deepEqual(loadRecovery(file), [pair]);
 });
 
 test("an answer is signed only while it is fresh", (t) => {

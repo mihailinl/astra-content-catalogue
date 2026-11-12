@@ -23,18 +23,39 @@ const READS_SECRET = /\$\{\{[^}]*\bsecrets\b/;
 
 test("one_job_reads_one_kinds_key", () => {
   const wf = workflow("sign.yml");
-  assert.deepEqual(Object.keys(wf.jobs), ["work", "sign"], "two jobs, and no third that could hold a key");
+  assert.deepEqual(Object.keys(wf.jobs), ["work", "prepare", "sign", "publish"], "four jobs, and only `sign` may hold a key");
   assert.deepEqual(wf.permissions, {}, "no permission by default");
-  const { work, sign } = wf.jobs;
+  const { work, prepare, sign, publish } = wf.jobs;
+
+  // the key secret is read in exactly one job, and in one step of it
+  const readers = Object.entries(wf.jobs).filter(([, job]) => READS_SECRET.test(spelled(job)) || /\bsecrets\b/.test(spelled(job)));
+  assert.deepEqual(readers.map(([id]) => id), ["sign"], "the key secret appears in exactly one job");
+  const uncommented = text("sign.yml").split("\n").filter((l) => !l.trim().startsWith("#")).join("\n");
+  assert.equal(uncommented.match(/secrets\b/g).length, 1, "`secrets` is written once in sign.yml");
+  assert.ok(!/secrets:\s*inherit/.test(uncommented));
+  for (const kind of KINDS) {
+    assert.equal(uncommented.split(secretOf(kind)).length - 1, 1, `${secretOf(kind)} is named by one leg`);
+    assert.equal(uncommented.split(environmentOf(kind)).length - 1, 1, `${environmentOf(kind)} is named by one leg`);
+  }
+  assert.ok(!/\bvars\./.test(spelled(wf)), "no repository variable is read anywhere in sign.yml");
+  assert.ok(!/GITHUB_(ENV|PATH)/.test(uncommented), "no step writes another step's environment or PATH");
 
   // work: the token for the service, and no secret
   assert.equal(work.environment, SERVICE_ENVIRONMENT);
   assert.deepEqual(work.permissions, { contents: "read", "id-token": "write" });
-  assert.ok(!READS_SECRET.test(spelled(work)) && !/\bsecrets\b/.test(spelled(work)), "work names no secret");
-  // its one use of the repository token is to read `data`, with a token that can only read
+  // its one use of the repository token is to read `data`
   assert.deepEqual(work.steps.filter((s) => s.env?.GITHUB_TOKEN).map((s) => s.run), ['node bin/data.mjs open --dir "$RUNNER_TEMP/data"']);
   assert.equal(work.env, undefined, "and no variable can point it at another service");
-  assert.ok(!/\bvars\./.test(spelled(wf)), "no repository variable is read anywhere in sign.yml");
+
+  // no job but `work` can mint an OIDC token or enters an environment that is not a kind's
+  for (const [id, job] of Object.entries(wf.jobs)) {
+    if (id !== "work") assert.ok(!spelled(job).includes("id-token") && job.environment !== SERVICE_ENVIRONMENT, `${id}: no OIDC token`);
+  }
+  // prepare and publish enter no environment, so they can read no key
+  assert.equal(prepare.environment, undefined);
+  assert.equal(publish.environment, undefined);
+  assert.deepEqual(prepare.permissions, { contents: "read" });
+  assert.deepEqual(publish.permissions, { contents: "write" }, "only the publishing job, which holds no key, can push data");
 
   // sign: one leg per kind, each naming its own environment and its own secret
   const legs = sign.strategy.matrix.include;
@@ -44,40 +65,51 @@ test("one_job_reads_one_kinds_key", () => {
     assert.deepEqual(leg, { kind: leg.kind, environment: environmentOf(leg.kind), secret: secretOf(leg.kind) }, leg.kind);
   }
   assert.equal(sign.environment, "${{ matrix.environment }}");
-  assert.equal(sign.strategy["max-parallel"], 1);
   assert.equal(sign.strategy["fail-fast"], false);
-  assert.deepEqual(sign.permissions, { contents: "write" }, "a signing leg can push data and cannot mint an OIDC token");
-  assert.ok(!spelled(sign).includes("id-token"));
+  assert.deepEqual(sign.permissions, {}, "the key job's token has no permission: no contents, no OIDC token");
+  assert.deepEqual(sign.env, { KIND: "${{ matrix.kind }}" }, "the job's environment is the kind's name and nothing else");
+  assert.equal(sign.outputs, undefined, "the key job hands nothing on but its artifact");
+  assert.equal(sign.needs, "prepare", "the key job waits on the preparing job alone");
 
-  // the key is in the environment of exactly one step of the leg, by the leg's own secret name
-  const naming = sign.steps.filter((s) => READS_SECRET.test(spelled(s)));
-  assert.equal(naming.length, 1, "one step sees the key");
-  assert.deepEqual(naming[0].env, { CONTENT_SIGNING_KEY: "${{ secrets[matrix.secret] }}" }, "and it sees nothing else: no token");
-  assert.equal(sign.steps.filter((s) => s.env && "CONTENT_SIGNING_KEY" in s.env).length, 1);
-  assert.equal(sign.env?.CONTENT_SIGNING_KEY, undefined, "the key is not in the job's environment");
-  // that step runs one Node file and nothing else: no second command, no pipe, no substitution, no action
-  assert.equal(naming[0].uses, undefined);
-  assert.match(naming[0].run, /^node bin\/sign\.mjs( --[a-z]+ ("\$[A-Z_]+(\/[a-z]+)?"|[A-Za-z0-9_.\/-]+))+$/);
-  assert.equal(naming[0].run, 'node bin/sign.mjs --kind "$KIND" --trust registry-trust/registry/v1/trust.json --work "$RUNNER_TEMP/work"');
-  assert.equal(naming[0].shell, undefined);
-  const uncommented = text("sign.yml").split("\n").filter((l) => !l.trim().startsWith("#")).join("\n");
-  assert.equal(uncommented.match(/secrets\b/g).length, 1, "`secrets` is written once in sign.yml");
-  assert.ok(!/secrets:\s*inherit/.test(uncommented));
-  for (const kind of KINDS) {
-    assert.equal(uncommented.split(secretOf(kind)).length - 1, 1, `${secretOf(kind)} is named by one leg`);
-    assert.equal(uncommented.split(environmentOf(kind)).length - 1, 1, `${environmentOf(kind)} is named by one leg`);
-  }
-  // the five steps of a leg, in order: the token only at the two ends, the key only in the middle,
-  // and the two steps that run the checker on either side of the key with neither
-  const commands = sign.steps.filter((s) => s.run).map((s) => ({ run: s.run.split(" ").slice(0, 3).join(" ").replace(/ --\w+$/, ""), env: Object.keys(s.env ?? {}) }));
-  assert.deepEqual(commands, [
+  // its steps: one fresh checkout of this commit, one download of the kind's prepared artifact,
+  // ONE node command, one upload; no setup action, no script, nothing else
+  const shape = sign.steps.map((s) => (s.uses ? s.uses.split("@")[0] : `run:${s.run.split(" ").slice(0, 2).join(" ")}`));
+  assert.deepEqual(shape, ["actions/checkout", "actions/download-artifact", "run:node bin/sign.mjs", "actions/upload-artifact"]);
+  const [checkout, download, key, upload] = sign.steps;
+  assert.deepEqual(checkout.with, { ref: "${{ github.sha }}", "persist-credentials": false }, "a fresh checkout of the same commit, no credential");
+  // its input is the artifact the preparing job uploaded for this kind, and only that
+  const prepared = prepare.steps.find((s) => s.uses?.startsWith("actions/upload-artifact@"));
+  assert.equal(prepared.with.name, "prepared-${{ matrix.kind }}");
+  assert.deepEqual(download.with, { name: prepared.with.name, path: "${{ runner.temp }}/prepared" }, "the input artifact is the preparing job's");
+  assert.equal(sign.steps.filter((s) => s.uses?.startsWith("actions/download-artifact@")).length, 1);
+  // the key is in the environment of that one step, by the leg's own secret name, and it sees nothing else
+  assert.deepEqual(key.env, { CONTENT_SIGNING_KEY: "${{ secrets[matrix.secret] }}" }, "the key step sees the key and no token");
+  assert.equal(key.shell, undefined);
+  assert.equal(key.run, 'node bin/sign.mjs --kind "$KIND" --work "$RUNNER_TEMP/prepared" --out "$RUNNER_TEMP/signed"', "one Node file and nothing else: no second command, no pipe, no substitution");
+  // its output is the signed artifact, and the publishing job takes it from there
+  assert.deepEqual(upload.with.name, "signed-${{ matrix.kind }}");
+  assert.equal(upload.with.path, "${{ runner.temp }}/signed");
+  assert.ok(publish.steps.some((s) => s.uses?.startsWith("actions/download-artifact@") && s.with.name === "signed-${{ matrix.kind }}"));
+
+  // the work job checks every answer before it becomes an artifact: the upload comes after the fetch, and takes its output dir
+  const fetchAt = work.steps.findIndex((s) => s.id === "fetch");
+  const uploadAt = work.steps.findIndex((s) => s.uses?.startsWith("actions/upload-artifact@"));
+  assert.ok(fetchAt >= 0 && uploadAt > fetchAt, "the answers are checked before they are uploaded");
+  assert.match(work.steps[fetchAt].run, /--out "\$RUNNER_TEMP\/exports"/);
+  assert.equal(work.steps[uploadAt].with.path, "${{ runner.temp }}/exports");
+
+  // the commands of the other jobs: the checker runs in prepare and publish, which hold no key
+  const runs = (job) => job.steps.filter((s) => s.run).map((s) => ({ run: s.run.split(" ").slice(0, 3).join(" ").replace(/ --\w+$/, ""), env: Object.keys(s.env ?? {}) }));
+  assert.deepEqual(runs(prepare), [
     { run: "node bin/data.mjs open", env: ["GITHUB_TOKEN"] },
     { run: "node bin/prepare.mjs", env: [] },
-    { run: "node bin/sign.mjs", env: ["CONTENT_SIGNING_KEY"] },
+  ]);
+  assert.deepEqual(runs(publish), [
+    { run: "node bin/data.mjs open", env: ["GITHUB_TOKEN"] },
     { run: "node bin/verify.mjs", env: [] },
     { run: "node bin/data.mjs publish", env: ["GITHUB_TOKEN"] },
   ]);
-  assert.deepEqual(sign.env, { KIND: "${{ matrix.kind }}" });
+  assert.equal(publish.strategy["max-parallel"], 1, "one push to data at a time");
 
   // no other workflow names a signing environment, a secret, or an OIDC token
   for (const name of fs.readdirSync(DIR).filter((n) => n !== "sign.yml")) {
@@ -94,15 +126,19 @@ test("sign.yml runs on main, every ten minutes and on a dispatch, one run at a t
   assert.deepEqual(wf.on, { schedule: [{ cron: "*/10 * * * *" }], workflow_dispatch: null });
   assert.deepEqual(wf.concurrency, { group: "content-sign", "cancel-in-progress": false });
   assert.equal(wf.jobs.work.if, "github.ref == 'refs/heads/main'");
-  assert.equal(wf.jobs.sign.needs, "work");
-  // a closed door leaves `todo` false, and then no signing leg starts
-  assert.equal(wf.jobs.sign.if, "${{ !cancelled() && needs.work.outputs.todo == 'true' }}");
   assert.equal(wf.jobs.work.outputs.todo, "${{ steps.fetch.outputs.todo }}");
-  // every checkout of this repository is of main, and leaves no credential behind
-  for (const job of Object.values(wf.jobs)) {
+  // a closed door leaves `todo` false, and then no later job starts
+  assert.equal(wf.jobs.prepare.needs, "work");
+  assert.equal(wf.jobs.prepare.if, "${{ !cancelled() && needs.work.outputs.todo == 'true' }}");
+  assert.equal(wf.jobs.sign.if, "${{ !cancelled() && needs.prepare.result != 'skipped' }}");
+  assert.deepEqual(wf.jobs.publish.needs, ["prepare", "sign"]);
+  assert.equal(wf.jobs.publish.if, "${{ !cancelled() && needs.sign.result != 'skipped' }}");
+  // every checkout of this repository is of the commit the run started from, and leaves no credential behind
+  for (const [id, job] of Object.entries(wf.jobs)) {
     for (const step of job.steps.filter((s) => s.uses?.startsWith("actions/checkout@"))) {
-      assert.equal(step.with.ref, "main");
-      assert.equal(step.with["persist-credentials"], false);
+      assert.equal(step.with["persist-credentials"], false, id);
+      if (step.with.repository === undefined) assert.equal(step.with.ref, "${{ github.sha }}", id);
+      else assert.deepEqual([step.with.repository, step.with.ref], ["mihailinl/astra-registry", "main"], `${id}: only trust.json is read from elsewhere`);
     }
   }
 });

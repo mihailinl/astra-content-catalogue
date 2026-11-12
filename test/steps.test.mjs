@@ -15,7 +15,7 @@ import { main as prepareMain } from "../bin/prepare.mjs";
 import { main as signMain } from "../bin/sign.mjs";
 import { checkDocument, checkerSelf, invocation } from "../lib/checker.mjs";
 import { DOCS, domainOf, Refused, sanitise } from "../lib/kinds.mjs";
-import { documentBytes, prepareKind, signPrepared, verifyAndInstall } from "../lib/pipeline.mjs";
+import { documentBytes, leaveOrder, prepareKind, signPrepared, verifyAndInstall } from "../lib/pipeline.mjs";
 import { kindKeysOf } from "../lib/trust.mjs";
 import { ROOT } from "../lib/vendored.mjs";
 import { privateKeyFromSeed, signEnvelope, verifyEnvelope } from "../vendor/astra-registry/bot/lib/sign.mjs";
@@ -23,20 +23,21 @@ import { exportOf, golden, NOW, scratch, seedSecret, snapshot, throwawayTrust, w
 
 const refusal = (code) => (e) => e instanceof Refused && e.code === code;
 
-/** Stages 1 and 2 done, stage 3 still to run. */
+/** The preparing job and the key job done, the publishing job still to run. */
 function signedWork(t, { kind = "commands", answer } = {}) {
   const { trust, seeds } = throwawayTrust();
   const dir = scratch(t);
   const dataDir = path.join(dir, "data");
-  const workDir = path.join(dir, "work");
+  const workDir = path.join(dir, "prepared");
+  const signedDir = path.join(dir, "signed");
   fs.mkdirSync(dataDir);
   const exportFile = writeExport(dir, kind, answer ?? exportOf(kind, { entries: golden(`index/${kind}/valid.json`).signed.entries }));
   prepareKind({ kind, exportFile, dataDir, trust, now: NOW, workDir, everHeld: false });
-  signPrepared({ kind, workDir, trust, secret: seedSecret(seeds[kind].current) });
-  return { trust, seeds, dataDir, workDir, kind };
+  signPrepared({ kind, workDir, outDir: signedDir, trust, secret: seedSecret(seeds[kind].current) });
+  return { trust, seeds, dataDir, workDir, signedDir, kind, everHeld: false };
 }
 
-test("the step with the key can start no process and open no connection", () => {
+test("the job with the key can start no process and open no connection", () => {
   // every module bin/sign.mjs loads, followed through every import it spells, static or dynamic
   const seen = new Set();
   const builtins = new Set();
@@ -70,35 +71,139 @@ test("the step with the key can start no process and open no connection", () => 
   for (const f of seen) assert.ok(!/\bfetch\s*\(|child_process|execFile|spawn/.test(code(f)), `${path.relative(ROOT, f)} neither fetches nor spawns`);
 });
 
-test("the step with the key signs only what the preparing step could honestly have written", (t) => {
+test("the job with the key reads one admitted artifact and signs only what could honestly have been prepared", (t) => {
   const { trust, seeds } = throwawayTrust();
   const secret = seedSecret(seeds.packs.current);
   const fresh = () => {
     const dir = scratch(t);
-    const workDir = path.join(dir, "work");
+    const workDir = path.join(dir, "prepared");
     fs.mkdirSync(path.join(dir, "data"));
     prepareKind({ kind: "packs", exportFile: writeExport(dir, "packs", exportOf("packs")), dataDir: path.join(dir, "data"), trust, now: NOW, workDir, everHeld: false });
-    return workDir;
+    return { workDir, outDir: path.join(dir, "signed") };
   };
+  assert.deepEqual(fs.readdirSync(fresh().workDir).sort(), ["index.signed.json", "order.json", "trust.json", "withdrawn.signed.json"], "the prepared artifact is these four files");
   const body = (w, doc) => path.join(w, `${doc}.signed.json`);
   const edit = (file, f) => fs.writeFileSync(file, f(fs.readFileSync(file, "utf8")));
+  const outside = scratch(t, "outside");
+  fs.writeFileSync(path.join(outside, "x"), "{}");
   const cases = {
-    "a body for another kind": (w) => edit(body(w, "index"), (s) => s.replace("astra.packs.index/1", "astra.models.index/1")),
-    "the withdrawn body in the index's place": (w) => fs.copyFileSync(body(w, "withdrawn"), body(w, "index")),
-    "a serial that is not the order's second": (w) => edit(body(w, "index"), (s) => s.replaceAll(String(NOW), String(NOW + 5))),
-    "a longer life": (w) => edit(body(w, "withdrawn"), (s) => s.replace(String(NOW + 7 * 86400), String(NOW + 70 * 86400))),
-    "a body that is not canonical JSON": (w) => edit(body(w, "index"), (s) => `${s} `),
-    "a member named twice": (w) => edit(body(w, "index"), (s) => s.replace('{"entries":[]', '{"entries":[],"entries":[]')),
-    "an order for another kind": (w) => edit(path.join(w, "order.json"), (s) => s.replace('"packs"', '"models"')),
-    "no order": (w) => fs.rmSync(path.join(w, "order.json")),
+    // what is in the artifact
+    E_ARTIFACT: {
+      "another file beside the four": (w) => fs.writeFileSync(path.join(w, "run.sh"), "#!/bin/sh\n"),
+      "a file named like a workflow command": (w) => fs.writeFileSync(path.join(w, "::error::x"), ""),
+      "a directory": (w) => fs.mkdirSync(path.join(w, "node_modules")),
+      "a link in a body's place": (w) => {
+        fs.rmSync(body(w, "index"));
+        fs.symlinkSync(path.join(outside, "x"), body(w, "index"));
+      },
+      "a link beside the four": (w) => fs.symlinkSync(outside, path.join(w, "more")),
+      "a body over a mebibyte": (w) => fs.writeFileSync(body(w, "withdrawn"), Buffer.alloc(1048577, 0x20)),
+      "an order over its bound": (w) => edit(path.join(w, "order.json"), (s) => s.replace("{", `{"pad":"${"x".repeat(9000)}",`)),
+      "a trust.json over its bound": (w) => fs.writeFileSync(path.join(w, "trust.json"), Buffer.alloc(256 * 1024 + 1, 0x20)),
+      "no trust.json": (w) => fs.rmSync(path.join(w, "trust.json")),
+      "no withdrawn body": (w) => fs.rmSync(body(w, "withdrawn")),
+      "no order": (w) => fs.rmSync(path.join(w, "order.json")),
+      "an order that is not JSON": (w) => fs.writeFileSync(path.join(w, "order.json"), "{"),
+      "an order for another kind": (w) => edit(path.join(w, "order.json"), (s) => s.replace('"packs"', '"models"')),
+      "an order with an outcome of its own": (w) => edit(path.join(w, "order.json"), (s) => s.replace('"prepared"', '"ready"')),
+      "a closed order that still carries bodies": (w) => edit(path.join(w, "order.json"), (s) => s.replace('"prepared"', '"closed"')),
+    },
+    // what the bodies are
+    E_PREPARED: {
+      "a body for another kind": (w) => edit(body(w, "index"), (s) => s.replace("astra.packs.index/1", "astra.models.index/1")),
+      "the withdrawn body in the index's place": (w) => fs.copyFileSync(body(w, "withdrawn"), body(w, "index")),
+      "a serial that is not the order's second": (w) => edit(body(w, "index"), (s) => s.replaceAll(String(NOW), String(NOW + 5))),
+      "a longer life": (w) => edit(body(w, "withdrawn"), (s) => s.replace(String(NOW + 7 * 86400), String(NOW + 70 * 86400))),
+      "a body that is not canonical JSON": (w) => edit(body(w, "index"), (s) => `${s} `),
+      "a member named twice": (w) => edit(body(w, "index"), (s) => s.replace('{"entries":[]', '{"entries":[],"entries":[]')),
+      "an order that names no second": (w) => edit(path.join(w, "order.json"), (s) => s.replace(`"now": ${NOW}`, '"now": "soon"')),
+    },
   };
-  for (const [name, damage] of Object.entries(cases)) {
-    const w = fresh();
-    damage(w);
-    assert.throws(() => signPrepared({ kind: "packs", workDir: w, trust, secret }), refusal("E_PREPARED"), name);
-    assert.ok(!fs.existsSync(path.join(w, "index.json")) || !fs.existsSync(path.join(w, "withdrawn.json")), `${name}: no signed pair is left`);
+  for (const [code, group] of Object.entries(cases)) {
+    for (const [name, damage] of Object.entries(group)) {
+      const w = fresh();
+      damage(w.workDir);
+      assert.throws(() => signPrepared({ kind: "packs", ...w, trust, secret }), refusal(code), name);
+      assert.deepEqual(fs.readdirSync(w.outDir), ["result.json"], `${name}: no signed document is left`);
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(w.outDir, "result.json"), "utf8")), { schema: "astra.content.signer-result/1", kind: "packs", outcome: "refused", code }, name);
+    }
   }
-  assert.equal(signPrepared({ kind: "packs", workDir: fresh(), trust, secret }).outcome, "signed");
+  // untouched: the signed artifact is exactly three files
+  const w = fresh();
+  assert.equal(signPrepared({ kind: "packs", ...w, trust, secret }).outcome, "signed");
+  assert.deepEqual(fs.readdirSync(w.outDir).sort(), ["index.json", "result.json", "withdrawn.json"]);
+  // a closed or refused order asks for nothing, needs no key and no trust.json, and gets no signature
+  for (const [outcome, said] of [["closed", "closed"], ["refused", "not-prepared"]]) {
+    const dir = scratch(t);
+    leaveOrder(path.join(dir, "prepared"), "packs", outcome);
+    assert.equal(signPrepared({ kind: "packs", workDir: path.join(dir, "prepared"), outDir: path.join(dir, "signed"), trust: null, secret: undefined }).outcome, said);
+    assert.deepEqual(fs.readdirSync(path.join(dir, "signed")), ["result.json"]);
+  }
+});
+
+test("the publishing job admits both artifacts, and publishes only over the data the kind was prepared against", (t) => {
+  // the signed artifact: three names, bounded, nothing else
+  const bad = {
+    "another file": (w) => fs.writeFileSync(path.join(w.signedDir, "extra.json"), "{}"),
+    "a link": (w) => {
+      fs.rmSync(path.join(w.signedDir, "index.json"));
+      fs.symlinkSync(path.join(w.workDir, "index.signed.json"), path.join(w.signedDir, "index.json"));
+    },
+    "a document over a mebibyte": (w) => fs.writeFileSync(path.join(w.signedDir, "index.json"), Buffer.alloc(1048577, 0x20)),
+    "a signed result with one document missing": (w) => fs.rmSync(path.join(w.signedDir, "withdrawn.json")),
+    "no result": (w) => fs.rmSync(path.join(w.signedDir, "result.json")),
+    "a result for another kind": (w) => fs.writeFileSync(path.join(w.signedDir, "result.json"), fs.readFileSync(path.join(w.signedDir, "result.json"), "utf8").replace('"commands"', '"models"')),
+    "something added to the prepared artifact": (w) => fs.writeFileSync(path.join(w.workDir, "extra"), ""),
+  };
+  for (const [name, damage] of Object.entries(bad)) {
+    const w = signedWork(t);
+    damage(w);
+    assert.throws(() => verifyAndInstall(w), refusal("E_ARTIFACT"), name);
+    assert.deepEqual(snapshot(w.dataDir), {}, `${name}: nothing is installed`);
+  }
+
+  // data moved between the preparing job and this one: another pair is there now
+  const { trust, seeds } = throwawayTrust();
+  const dir = scratch(t);
+  const dataDir = path.join(dir, "data");
+  const secret = seedSecret(seeds.models.current);
+  const heldNow = () => fs.existsSync(path.join(dataDir, "state", "models.json"));
+  const jobs = (now, name) => {
+    const workDir = path.join(dir, `${name}-prepared`);
+    const signedDir = path.join(dir, `${name}-signed`);
+    prepareKind({ kind: "models", exportFile: writeExport(dir, "models", exportOf("models", { at: now, state: name.padEnd(64, "0").replace(/[^0-9a-f]/g, "a") })), dataDir, trust, now, workDir, everHeld: heldNow() });
+    signPrepared({ kind: "models", workDir, outDir: signedDir, trust, secret });
+    return { kind: "models", workDir, signedDir, dataDir, trust, everHeld: heldNow() };
+  };
+  fs.mkdirSync(dataDir);
+  const first = jobs(NOW, "a1");
+  const second = jobs(NOW + 5, "b2"); // prepared against the same empty data
+  assert.equal(verifyAndInstall(first).outcome, "signed");
+  const held = snapshot(dataDir);
+  assert.throws(() => verifyAndInstall({ ...second, everHeld: true }), refusal("E_DATA_MOVED"));
+  assert.deepEqual(snapshot(dataDir), held);
+  // and the other way: prepared over a pair that is no longer the one on data
+  const third = jobs(NOW + 10, "c3");
+  const fourth = jobs(NOW + 20, "d4");
+  assert.equal(verifyAndInstall(third).outcome, "signed");
+  assert.throws(() => verifyAndInstall(fourth), refusal("E_DATA_MOVED"));
+
+  // a kind that was not prepared, or not signed, is nothing to do here, quietly
+  const quiet = (order, result) => {
+    const d = scratch(t);
+    leaveOrder(path.join(d, "prepared"), "packs", order);
+    fs.mkdirSync(path.join(d, "signed"));
+    fs.writeFileSync(path.join(d, "signed", "result.json"), JSON.stringify({ schema: "astra.content.signer-result/1", kind: "packs", outcome: result }));
+    return verifyAndInstall({ kind: "packs", workDir: path.join(d, "prepared"), signedDir: path.join(d, "signed"), dataDir, trust, everHeld: false }).outcome;
+  };
+  assert.equal(quiet("closed", "closed"), "closed");
+  assert.equal(quiet("refused", "not-prepared"), "not-prepared");
+  assert.throws(() => quiet("closed", "unchanged"), refusal("E_PREPARED"));
+  const w = signedWork(t);
+  fs.rmSync(path.join(w.signedDir, "index.json"));
+  fs.rmSync(path.join(w.signedDir, "withdrawn.json"));
+  fs.writeFileSync(path.join(w.signedDir, "result.json"), JSON.stringify({ schema: "astra.content.signer-result/1", kind: "commands", outcome: "refused", code: "E_KEY_NOT_TRUSTED" }));
+  assert.equal(verifyAndInstall(w).outcome, "not-signed");
 });
 
 test("each verifier refuses by itself, and what was signed must be what was prepared", (t) => {
@@ -107,7 +212,7 @@ test("each verifier refuses by itself, and what was signed must be what was prep
   /** Replace the signed index with the same body signed by `seed`, as a compromised key step might. */
   const resign = (w, seed, domain = domainOf("commands", "index")) => {
     const signed = JSON.parse(fs.readFileSync(path.join(w.workDir, "index.signed.json"), "utf8"));
-    fs.writeFileSync(path.join(w.workDir, "index.json"), documentBytes(signEnvelope({ domain, signed, signers: [{ key_id: "astra-commands-testa", privateKey: privateKeyFromSeed(seed) }] })));
+    fs.writeFileSync(path.join(w.signedDir, "index.json"), documentBytes(signEnvelope({ domain, signed, signers: [{ key_id: "astra-commands-testa", privateKey: privateKeyFromSeed(seed) }] })));
   };
   const cases = [
     ["another key's signature", (w) => resign(w, crypto.randomBytes(32))],
@@ -135,19 +240,22 @@ test("each verifier refuses by itself, and what was signed must be what was prep
   // a validly signed document over a body other than the one that was checked
   w = signedWork(t);
   const other = { ...JSON.parse(fs.readFileSync(path.join(w.workDir, "index.signed.json"), "utf8")), entries: [] };
-  fs.writeFileSync(path.join(w.workDir, "index.json"), documentBytes(signEnvelope({ domain: domainOf("commands", "index"), signed: other, signers: [{ key_id: "astra-commands-testa", privateKey: privateKeyFromSeed(w.seeds.commands.current) }] })));
+  fs.writeFileSync(path.join(w.signedDir, "index.json"), documentBytes(signEnvelope({ domain: domainOf("commands", "index"), signed: other, signers: [{ key_id: "astra-commands-testa", privateKey: privateKeyFromSeed(w.seeds.commands.current) }] })));
   assert.throws(() => verifyAndInstall(w), refusal("E_SIGNED_OTHER"));
   // two signatures, or a result naming a key of another kind
   w = signedWork(t);
-  const env = JSON.parse(fs.readFileSync(path.join(w.workDir, "index.json"), "utf8"));
-  fs.writeFileSync(path.join(w.workDir, "index.json"), documentBytes({ ...env, signatures: [...env.signatures, ...env.signatures] }));
+  const env = JSON.parse(fs.readFileSync(path.join(w.signedDir, "index.json"), "utf8"));
+  fs.writeFileSync(path.join(w.signedDir, "index.json"), documentBytes({ ...env, signatures: [...env.signatures, ...env.signatures] }));
   assert.throws(() => verifyAndInstall(w), refusal("E_SELF_VERIFY"));
   w = signedWork(t);
-  fs.writeFileSync(path.join(w.workDir, "result.json"), fs.readFileSync(path.join(w.workDir, "result.json"), "utf8").replace("astra-commands-testa", "astra-models-testa"));
+  fs.writeFileSync(path.join(w.signedDir, "result.json"), fs.readFileSync(path.join(w.signedDir, "result.json"), "utf8").replace("astra-commands-testa", "astra-models-testa"));
   assert.throws(() => verifyAndInstall(w), refusal("E_SELF_VERIFY"));
   // a key step that claims "unchanged" for an order that was not
   w = signedWork(t);
-  fs.writeFileSync(path.join(w.workDir, "result.json"), fs.readFileSync(path.join(w.workDir, "result.json"), "utf8").replace('"signed"', '"unchanged"'));
+  fs.writeFileSync(path.join(w.signedDir, "result.json"), fs.readFileSync(path.join(w.signedDir, "result.json"), "utf8").replace('"signed"', '"unchanged"'));
+  assert.throws(() => verifyAndInstall(w), refusal("E_ARTIFACT"), "an unchanged result that still carries documents");
+  fs.rmSync(path.join(w.signedDir, "index.json"));
+  fs.rmSync(path.join(w.signedDir, "withdrawn.json"));
   assert.throws(() => verifyAndInstall(w), refusal("E_PREPARED"));
   assert.deepEqual(snapshot(w.dataDir), {});
 
@@ -209,14 +317,25 @@ test("a refusal prints a code and a sanitised location, never a value", (t) => {
     assert.match(lines[0], /^commands: not signed \(E_[A-Z_]+( at [A-Za-z0-9_.\/$-]{1,200})?\); the last signed documents stay$/, `case ${i}: ${lines[0]}`);
     assert.ok(!printed.includes("::") && !printed.includes(secretWord.slice(0, 7)) && !printed.includes("@"), `case ${i}: ${printed}`);
   }
-  // the step with the key prints nothing a file gave it either
+  // the job with the key prints nothing a file gave it either
   const dir = scratch(t);
-  fs.mkdirSync(path.join(dir, "work"));
-  fs.writeFileSync(path.join(dir, "work", "order.json"), JSON.stringify({ schema: "astra.content.signer-order/1", kind: "commands", outcome: "prepared", now: NOW, last_key_id: `::error::${secretWord}`, unchanged_under: null }));
-  fs.writeFileSync(path.join(dir, "trust.json"), JSON.stringify(doc));
-  const lines = [];
-  assert.equal(signMain(["--kind", "commands", "--trust", path.join(dir, "trust.json"), "--work", path.join(dir, "work")], { env: { CONTENT_SIGNING_KEY: seedSecret(seeds.commands.current) }, now: NOW, roots, log: (l) => lines.push(l) }), 1);
-  assert.deepEqual(lines, ["commands: not signed (E_PREPARED at index); the last signed documents stay"]);
+  const { trust } = throwawayTrust();
+  void trust;
+  fs.mkdirSync(path.join(dir, "data"));
+  const mine = throwawayTrust();
+  prepareKind({ kind: "commands", exportFile: writeExport(dir, "commands", exportOf("commands")), dataDir: path.join(dir, "data"), trust: mine.trust, now: NOW, workDir: path.join(dir, "prepared"), everHeld: false });
+  const orderFile = path.join(dir, "prepared", "order.json");
+  fs.writeFileSync(orderFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(orderFile, "utf8")), last_key_id: `::error::${secretWord}`, now: `::error::${secretWord}` }));
+  fs.writeFileSync(path.join(dir, "prepared", `::notice::${secretWord}`), "");
+  for (const remove of [false, true]) {
+    if (remove) fs.rmSync(path.join(dir, "prepared", `::notice::${secretWord}`));
+    const lines = [];
+    const code = signMain(["--kind", "commands", "--work", path.join(dir, "prepared"), "--out", path.join(dir, "signed")], { env: { CONTENT_SIGNING_KEY: seedSecret(mine.seeds.commands.current) }, now: NOW, roots: mine.roots, log: (l) => lines.push(l) });
+    assert.equal(code, 1);
+    assert.deepEqual(lines, [`commands: not signed (${remove ? "E_PREPARED" : "E_ARTIFACT"}); the last signed documents stay`]);
+    assert.deepEqual(fs.readdirSync(path.join(dir, "signed")), ["result.json"]);
+    assert.ok(!fs.readFileSync(path.join(dir, "signed", "result.json"), "utf8").includes(secretWord));
+  }
 });
 
 test("the checker is started isolated, with PATH and nothing else", (t) => {

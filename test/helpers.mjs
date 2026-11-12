@@ -6,6 +6,7 @@
 // (vendor/astraplugins/testdata/content/README.md), which are trusted by
 // nothing outside a test.
 
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -109,18 +110,28 @@ export function snapshot(dir) {
 export const holds = (dataDir, kind) => [...DOCS.map((d) => documentPath(kind, d)), statePath(kind)].some((f) => fs.existsSync(path.join(dataDir, f)));
 
 /**
- * The three stages of one leg, one after another, as the workflow's three
- * middle steps run them (lib/pipeline.mjs). Returns the report of the last.
+ * The three stages of one kind, one after another, as the workflow's three
+ * jobs run them (lib/pipeline.mjs). Returns the report of the last.
  */
-export function signKind({ kind, exportFile, dataDir, trust, secret, now, tmpDir, everHeld = holds(dataDir, kind), verify, check }) {
-  const workDir = fs.mkdtempSync(path.join(tmpDir, "work-"));
+export function signKind({ kind, exportFile, dataDir, trust, secret, now, tmpDir, everHeld = holds(dataDir, kind), accepted = [], verify, check }) {
+  const base = fs.mkdtempSync(path.join(tmpDir, "jobs-"));
+  const workDir = path.join(base, "prepared");
+  const signedDir = path.join(base, "signed");
   try {
-    prepareKind({ kind, exportFile, dataDir, trust, now, workDir, everHeld });
-    signPrepared({ kind, workDir, trust, secret });
-    return verifyAndInstall({ kind, workDir, dataDir, trust, ...(verify ? { verify } : {}), ...(check ? { check } : {}) });
+    prepareKind({ kind, exportFile, dataDir, trust, now, workDir, everHeld, accepted });
+    signPrepared({ kind, workDir, outDir: signedDir, trust, secret });
+    return verifyAndInstall({ kind, workDir, signedDir, dataDir, trust, everHeld, accepted, ...(verify ? { verify } : {}), ...(check ? { check } : {}) });
   } finally {
-    fs.rmSync(workDir, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true });
   }
+}
+
+/** Make `dir` a git repository holding what is in it as one commit on `data` (for code that asks the branch's history). */
+export function commitData(dir, message = "data") {
+  const git = (...a) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "commit.gpgsign=false", ...a], { encoding: "utf8" });
+  if (!fs.existsSync(path.join(dir, ".git"))) git("init", "-q", "-b", "data");
+  git("add", "-A");
+  git("commit", "-q", "--allow-empty", "-m", message);
 }
 
 /** Write a kind's pair and state into a data directory, signed by `seed` under `keyId`, as the signer would have. */

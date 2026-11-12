@@ -61,3 +61,23 @@ jobs:
 
       - name: The owner's scripts parse
         run: bash -n owner/create.sh && bash -n owner/secrets.sh
+
+  key-job-node:
+    # sign.yml's key job installs no Node: it runs bin/sign.mjs on the Node
+    # the runner image ships, so that no setup action runs beside the key.
+    # This job proves the leg works on that Node, whatever version it is now.
+    name: The leg on the runner's own Node (as the key job runs it)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The runner's own Node
+        run: node --version
+
+      - name: The three jobs of a leg, and the key job's limits
+        run: node --test test/data.test.mjs test/steps.test.mjs
