@@ -14,12 +14,12 @@ import path from "node:path";
 
 const here = path.dirname(process.argv[1]);
 const stateFile = path.join(here, "state.json");
-const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, "utf8")) : { environments: {}, rulesets: [], secrets: {}, nextId: 1 };
+const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, "utf8")) : { environments: {}, rulesets: [], secrets: {}, data: {}, nextId: 1 };
 const argv = process.argv.slice(2);
 const stdin = () => fs.readFileSync(0);
 const done = (out = "", record = {}) => {
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
-  fs.appendFileSync(path.join(here, "calls.jsonl"), `${JSON.stringify({ argv, ...record })}\n`);
+  fs.appendFileSync(path.join(here, "calls.jsonl"), `${JSON.stringify({ argv, env: Object.keys(process.env).sort(), ...record })}\n`);
   if (out) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
   process.exit(0);
 };
@@ -43,8 +43,9 @@ if (argv[0] === "api") {
   let jq = null;
   let input = false;
   let route = null;
+  let raw = false;
   for (let i = 1; i < argv.length; i++) {
-    if (argv[i] === "-H") i++;
+    if (argv[i] === "-H") raw = argv[++i] === "Accept: application/vnd.github.raw" || raw;
     else if (argv[i] === "--method") method = argv[++i];
     else if (argv[i] === "--jq") jq = argv[++i];
     else if (argv[i] === "--input") input = argv[++i] === "-";
@@ -53,7 +54,25 @@ if (argv[0] === "api") {
     else fail("unexpected argument");
   }
   const body = input ? JSON.parse(stdin().toString("utf8")) : null;
+  const REPO_ID = { "mihailinl/astra-content-catalogue": 1454718826 };
   let m;
+  if ((m = /^repos\/([^/]+\/[^/]+)\/contents\/(.+)\?ref=data$/.exec(route)) && method === "GET" && raw) {
+    if (!(m[2] in (state.data ?? {}))) {
+      process.stderr.write("gh: Not Found (HTTP 404)\n");
+      process.exit(1);
+    }
+    done(state.data[m[2]]);
+  }
+  if ((m = /^repos\/([^/]+\/[^/]+)\/environments\/([a-z-]+)$/.exec(route)) && method === "GET") {
+    const env = state.environments[m[2]];
+    if (!env) fail("no such environment");
+    done(JSON.stringify({ name: m[2], deployment_branch_policy: env.settings.deployment_branch_policy }));
+  }
+  if ((m = /^repos\/([^/]+\/[^/]+)\/rulesets\/(\d+)$/.exec(route)) && method === "GET") {
+    const r = state.rulesets.find((x) => x.id === Number(m[2]));
+    if (!r) fail("no such ruleset");
+    done(JSON.stringify(r));
+  }
   if ((m = /^repos\/([^/]+\/[^/]+)\/environments\/([a-z-]+)$/.exec(route)) && method === "PUT") {
     state.environments[m[2]] = { ...(state.environments[m[2]] ?? { policies: [] }), settings: body };
     done("{}");
@@ -66,6 +85,7 @@ if (argv[0] === "api") {
       done("{}");
     }
     const names = env.policies.map((p) => p.name);
+    if (jq === null) done(JSON.stringify({ total_count: env.policies.length, branch_policies: env.policies }));
     if (jq === ".branch_policies[].name") done(names.join("\n"));
     if (jq === '[.branch_policies[].name] | map(select(. != "main")) | join(" ")') done(names.filter((n) => n !== "main").join(" "));
     fail("an unmodelled --jq");
@@ -75,6 +95,7 @@ if (argv[0] === "api") {
       state.rulesets.push({ id: state.nextId++, ...body });
       done("{}");
     }
+    if (jq === null) done(JSON.stringify(state.rulesets.map(({ id, name, target, enforcement }) => ({ id, name, target, enforcement }))));
     const sel = /^\.\[\] \| select\(\.name == "(.*)"\) \| \.id$/.exec(jq ?? "");
     if (!sel) fail("an unmodelled --jq");
     done(state.rulesets.filter((r) => r.name === sel[1]).map((r) => r.id).join("\n"));
@@ -85,9 +106,11 @@ if (argv[0] === "api") {
     state.rulesets[i] = { id: Number(m[2]), ...body };
     done("{}");
   }
-  if (/^repos\/[^/]+\/[^/]+$/.test(route) && method === "GET") {
+  if ((m = /^repos\/([^/]+\/[^/]+)$/.exec(route)) && method === "GET") {
+    const id = REPO_ID[m[1]] ?? 999;
+    if (jq === null) done(JSON.stringify({ id, owner: { id: 193032699 } }));
     if (jq !== '"repository_id        \\(.id)\\nrepository_owner_id  \\(.owner.id)"') fail("an unmodelled --jq");
-    done("repository_id        1000000001\nrepository_owner_id  2000000002");
+    done(`repository_id        ${id}\nrepository_owner_id  193032699`);
   }
 }
 fail("an unmodelled call");

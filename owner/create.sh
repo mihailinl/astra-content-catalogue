@@ -15,7 +15,19 @@
 #                  each deployable from `main` only. A job on any other
 #                  branch cannot enter one, so it cannot mint the service's
 #                  token (content-service) or read a key (publish-<kind>).
-#   main           ruleset `main: no deletion, no forced update`.
+#   main           ruleset `main: no deletion, no forced update`, for everybody,
+#                  with no bypass.
+#                  ruleset `main: updated by administrators only`: updating
+#                  the branch is restricted, and the repository's admin role
+#                  is the one bypass actor. This is what keeps the code the
+#                  signing legs run out of reach of everything but an
+#                  administrator: a signing leg's own token can write
+#                  contents (it must, to push `data`), GitHub cannot limit a
+#                  token to one branch, and without this rule that token, or
+#                  any collaborator with write access, could change the code
+#                  on `main` that the next run executes beside the keys.
+#                  owner/secrets.sh uploads no key until this ruleset exists
+#                  and is active.
 #   data           ruleset `data: forward only`: no deletion and no forced
 #                  update, for everybody, with no bypass.
 #                  ruleset `data: written by the workflow only`: creating and
@@ -30,6 +42,8 @@ REPO="${1:-mihailinl/astra-content-catalogue}"
 KINDS=(commands characters models animsets packs)
 # The GitHub Actions app, the actor behind a workflow run's token.
 ACTIONS_APP_ID=15368
+# The repository role `admin`, as rulesets number it.
+ADMIN_ROLE_ID=5
 
 api() { gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
 
@@ -75,6 +89,12 @@ ruleset "main: no deletion, no forced update" '{
   "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
   "bypass_actors": [],
   "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}]
+}'
+ruleset "main: updated by administrators only" '{
+  "name": "main: updated by administrators only", "target": "branch", "enforcement": "active",
+  "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+  "bypass_actors": [{"actor_id": '"$ADMIN_ROLE_ID"', "actor_type": "RepositoryRole", "bypass_mode": "always"}],
+  "rules": [{"type": "update"}]
 }'
 ruleset "data: forward only" '{
   "name": "data: forward only", "target": "branch", "enforcement": "active",

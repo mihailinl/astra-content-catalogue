@@ -11,21 +11,37 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 
-import { environmentOf, KINDS, secretOf } from "../lib/kinds.mjs";
+import { documentPath, environmentOf, KINDS, REPOSITORY_ID, REPOSITORY_OWNER_ID, secretOf } from "../lib/kinds.mjs";
 import { ROOT } from "../lib/vendored.mjs";
 import { main as secretsMain } from "../owner/secrets.mjs";
-import { NOW, scratch, seedSecret, throwawayTrust } from "./helpers.mjs";
+import { NOW, plant, scratch, seedSecret, throwawayTrust } from "./helpers.mjs";
 
 const REPO = "mihailinl/astra-content-catalogue";
 
-/** A directory holding `gh`, to put first on PATH. */
-function fakeGh(t) {
+let createdState = null;
+
+/** A directory holding `gh`, to put first on PATH. Unless `bare`, owner/create.sh has been run against it. */
+function fakeGh(t, { bare = false } = {}) {
   const bin = scratch(t, "gh");
   fs.copyFileSync(path.join(ROOT, "test", "fixtures", "fake-gh.mjs"), path.join(bin, "gh"));
   fs.chmodSync(path.join(bin, "gh"), 0o755);
+  if (!bare) {
+    // owner/create.sh is run against the stand-in once, and each later stand-in starts from what it left
+    if (createdState === null) {
+      execFileSync("bash", [path.join(ROOT, "owner", "create.sh")], { env: { PATH: `${bin}:${process.env.PATH}`, HOME: bin }, encoding: "utf8" });
+      createdState = fs.readFileSync(path.join(bin, "state.json"), "utf8");
+      fs.rmSync(path.join(bin, "calls.jsonl"));
+    } else fs.writeFileSync(path.join(bin, "state.json"), createdState);
+  }
   return {
     bin,
     path: `${bin}:${process.env.PATH}`,
+    setState: (f) => {
+      const st = JSON.parse(fs.readFileSync(path.join(bin, "state.json"), "utf8"));
+      f(st);
+      fs.writeFileSync(path.join(bin, "state.json"), JSON.stringify(st));
+    },
+    uploads: () => (fs.existsSync(path.join(bin, "calls.jsonl")) ? fs.readFileSync(path.join(bin, "calls.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []).filter((c) => c.argv[0] === "secret"),
     state: () => (fs.existsSync(path.join(bin, "state.json")) ? JSON.parse(fs.readFileSync(path.join(bin, "state.json"), "utf8")) : { secrets: {} }),
     calls: () => (fs.existsSync(path.join(bin, "calls.jsonl")) ? fs.readFileSync(path.join(bin, "calls.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []),
   };
@@ -51,11 +67,11 @@ function keysDir(t, trust, { only = null } = {}) {
   return dir;
 }
 
-async function secrets(t, trust, argv, gh) {
+async function secrets(t, trust, argv, gh, extraEnv = {}) {
   const trustFile = path.join(scratch(t, "trust"), "trust.json");
   fs.writeFileSync(trustFile, JSON.stringify(trust.doc));
   const lines = [];
-  const code = await secretsMain([...argv, "--trust", trustFile], { roots: trust.roots, now: NOW, log: (l) => lines.push(l), env: { PATH: gh.path, HOME: gh.bin } });
+  const code = await secretsMain([...argv, "--trust", trustFile], { roots: trust.roots, now: NOW, log: (l) => lines.push(l), env: { PATH: gh.path, HOME: gh.bin, ...extraEnv } });
   return { code, lines, trustFile };
 }
 
@@ -67,7 +83,7 @@ test("owner/secrets: each kind's current key goes to its own environment, throug
   assert.equal(code, 0);
   assert.deepEqual(lines, [...KINDS.map((k) => `${k} astra-${k}-testa match`), ...KINDS.map((k) => `${k} astra-${k}-testa uploaded to publish-${k}`)]);
 
-  const calls = gh.calls();
+  const calls = gh.uploads();
   assert.deepEqual(
     calls.map((c) => c.argv),
     KINDS.map((k) => ["secret", "set", secretOf(k), "--env", environmentOf(k), "--repo", REPO]),
@@ -121,7 +137,7 @@ test("owner/secrets --rotate: the kind's next key, and only that, before any tru
   assert.equal((await secrets(t, trust, [dir], gh)).code, 0);
   assert.equal(held(), seedSecret(trust.seeds.animsets.current));
 
-  const count = gh.calls().length;
+  const count = gh.uploads().length;
   const rotated = await secrets(t, trust, [dir, "--rotate", "animsets"], gh);
   assert.equal(rotated.code, 0);
   assert.deepEqual(rotated.lines, [
@@ -129,7 +145,7 @@ test("owner/secrets --rotate: the kind's next key, and only that, before any tru
     "animsets astra-animsets-testb uploaded to publish-animsets",
     "animsets: the next Sign run signs both documents with astra-animsets-testb; the trust change that names it current can follow",
   ]);
-  assert.equal(gh.calls().length, count + 1, "one upload, for the one kind");
+  assert.equal(gh.uploads().length, count + 1, "one upload, for the one kind");
   assert.equal(held(), seedSecret(trust.seeds.animsets.next));
   await assert.rejects(secrets(t, trust, [dir, "--rotate", "games"], gh), /is not one of/);
 
@@ -185,15 +201,121 @@ test("owner/secrets as shipped believes only the compiled roots, and fails when 
   assert.match(r.stderr, /E_TRUST_UNVERIFIED/);
   assert.deepEqual(gh.calls(), []);
 
-  // gh failing is a failed run that says which kind, and stops there
-  fs.writeFileSync(path.join(gh.bin, "gh"), "#!/bin/sh\necho 'HTTP 404: environment not found' >&2\nexit 1\n");
+  // gh failing at the upload is a failed run that says which kind, and stops there
+  const real = fs.readFileSync(path.join(gh.bin, "gh"), "utf8");
+  fs.renameSync(path.join(gh.bin, "gh"), path.join(gh.bin, "gh-real"));
+  fs.writeFileSync(path.join(gh.bin, "gh"), `#!/bin/sh\nif [ "$1" = secret ]; then echo 'HTTP 500: try again' >&2; exit 1; fi\nexec node "${gh.bin}/gh-real" "$@"\n`);
+  fs.chmodSync(path.join(gh.bin, "gh"), 0o755);
+  void real;
   const failed = await secrets(t, trust, [dir], gh);
   assert.equal(failed.code, 1);
-  assert.deepEqual(failed.lines.slice(5), ["commands astra-commands-testa NOT uploaded: gh exited 1 (HTTP 404: environment not found)"]);
+  assert.deepEqual(failed.lines.slice(5), ["commands astra-commands-testa NOT uploaded: gh exited 1 (HTTP 500: try again)"]);
+  // gh failing at a question is a failed run too: nothing is assumed about what could not be read
+  fs.writeFileSync(path.join(gh.bin, "gh"), "#!/bin/sh\necho 'HTTP 403: forbidden' >&2\nexit 1\n");
+  await assert.rejects(secrets(t, trust, [dir], gh), /gh api repos\/mihailinl\/astra-content-catalogue failed \(HTTP 403: forbidden\)/);
 });
 
-test("owner/create.sh: environments on main only, three rulesets, the two ids, and a second run changes nothing", (t) => {
+test("owner/secrets uploads no key until GitHub is set up as owner/create.sh sets it", async (t) => {
+  const trust = throwawayTrust();
+  const refusedBy = async (name, argv, prepare, why, o = {}) => {
+    const gh = fakeGh(t, o);
+    const dir = keysDir(t, trust);
+    prepare(gh);
+    const r = await secrets(t, trust, [dir, ...argv], gh);
+    assert.equal(r.code, 1, name);
+    assert.ok(r.lines.some((l) => l.startsWith("refused: ") && l.includes(why)), `${name}: ${r.lines.join(" | ")}`);
+    assert.equal(r.lines.at(-1), "nothing was uploaded", name);
+    assert.deepEqual(gh.uploads(), [], `${name}: no secret is set, for any kind`);
+  };
+  const ruleset = (st, name) => st.rulesets.find((r) => r.name === name);
+  const ADMINS = "main: updated by administrators only";
+
+  // main: the ruleset that keeps the code beside the keys out of every writer's reach
+  await refusedBy("no ruleset restricts main", [], (gh) => gh.setState((st) => (st.rulesets = st.rulesets.filter((r) => r.name !== ADMINS))), "no active ruleset restricts updates of main");
+  await refusedBy("the ruleset is not enforced", [], (gh) => gh.setState((st) => (ruleset(st, ADMINS).enforcement = "disabled")), "no active ruleset restricts updates of main");
+  await refusedBy("the ruleset is only evaluated", [], (gh) => gh.setState((st) => (ruleset(st, ADMINS).enforcement = "evaluate")), "no active ruleset restricts updates of main");
+  await refusedBy("the ruleset covers another branch", [], (gh) => gh.setState((st) => (ruleset(st, ADMINS).conditions.ref_name.include = ["refs/heads/dev"])), "no active ruleset restricts updates of main");
+  await refusedBy("the ruleset excludes main again", [], (gh) => gh.setState((st) => (ruleset(st, ADMINS).conditions.ref_name.exclude = ["refs/heads/main"])), "no active ruleset restricts updates of main");
+  await refusedBy("the ruleset does not restrict updates", [], (gh) => gh.setState((st) => (ruleset(st, ADMINS).rules = [{ type: "deletion" }])), "no active ruleset restricts updates of main");
+  await refusedBy("GitHub Actions may bypass it", [], (gh) => gh.setState((st) => ruleset(st, ADMINS).bypass_actors.push({ actor_id: 15368, actor_type: "Integration", bypass_mode: "always" })), "no active ruleset restricts updates of main");
+  await refusedBy("the write role may bypass it", [], (gh) => gh.setState((st) => (ruleset(st, ADMINS).bypass_actors = [{ actor_id: 4, actor_type: "RepositoryRole", bypass_mode: "always" }])), "no active ruleset restricts updates of main");
+
+  // the kind's environment: main and nothing else
+  await refusedBy("an environment that also deploys from dev", [], (gh) => gh.setState((st) => st.environments["publish-models"].policies.push({ name: "dev", type: "branch" })), "publish-models must deploy from main only");
+  await refusedBy("an environment that deploys from dev only", [], (gh) => gh.setState((st) => (st.environments["publish-models"].policies = [{ name: "dev", type: "branch" }])), "publish-models must deploy from main only");
+  await refusedBy("an environment with no branch named", [], (gh) => gh.setState((st) => (st.environments["publish-packs"].policies = [])), "publish-packs must deploy from main only");
+  await refusedBy("an environment open to every branch", [], (gh) => gh.setState((st) => (st.environments["publish-packs"].settings.deployment_branch_policy = null)), "publish-packs is not restricted to named branches");
+  await refusedBy("an environment restricted to protected branches instead", [], (gh) => gh.setState((st) => (st.environments["publish-packs"].settings.deployment_branch_policy = { protected_branches: true, custom_branch_policies: false })), "publish-packs is not restricted to named branches");
+  await refusedBy("--rotate into an environment that also deploys from dev", ["--rotate", "models"], (gh) => gh.setState((st) => st.environments["publish-models"].policies.push({ name: "dev", type: "branch" })), "publish-models must deploy from main only");
+
+  // another repository, whatever it is called
+  await refusedBy("another repository", ["--repo", "mihailinl/astra-content-catalogue-staging"], () => {}, "is not the signer's repository");
+  assert.equal(REPOSITORY_ID, 1454718826);
+
+  // only the kinds asked for are looked at: a rotation of one kind does not wait on another kind's environment
   const gh = fakeGh(t);
+  gh.setState((st) => st.environments["publish-packs"].policies.push({ name: "dev", type: "branch" }));
+  assert.equal((await secrets(t, trust, [keysDir(t, trust), "--rotate", "models"], gh)).code, 0);
+});
+
+test("owner/secrets does not put the current key back over a rotation in progress", async (t) => {
+  const trust = throwawayTrust();
+  const gh = fakeGh(t);
+  const dir = keysDir(t, trust);
+  const slot = `${REPO}/publish-models/ASTRA_MODELS_SIGNING_KEY`;
+  const held = () => Buffer.from(gh.state().secrets[slot], "base64").toString().trim();
+  /** What `data` holds for a kind, as the signer would have published it under `role`'s key. */
+  const published = (kind, role) => {
+    const d = scratch(t, "data");
+    plant(d, kind, { seed: trust.seeds[kind][role], keyId: trust.trust.kindKeys(kind)[role].key_id, serial: NOW - 60 });
+    gh.setState((st) => {
+      for (const doc of ["index", "withdrawn"]) st.data[documentPath(kind, doc)] = fs.readFileSync(path.join(d, documentPath(kind, doc)), "utf8");
+    });
+  };
+  assert.equal((await secrets(t, trust, [dir], gh)).code, 0);
+  published("models", "current");
+  published("packs", "current");
+  assert.equal((await secrets(t, trust, [dir], gh)).code, 0, "documents signed with the current key: a plain run uploads");
+
+  // the rotation: the next key is placed, and the signer publishes under it
+  assert.equal((await secrets(t, trust, [dir, "--rotate", "models"], gh)).code, 0);
+  published("models", "next");
+  assert.equal(held(), seedSecret(trust.seeds.models.next));
+
+  // before the ceremony, a plain run for every kind: nothing is uploaded, and the next key stays in place
+  const n = gh.uploads().length;
+  const plain = await secrets(t, trust, [dir], gh);
+  assert.equal(plain.code, 1);
+  assert.ok(plain.lines.includes("refused: models was last signed with its NEXT key (a rotation is in progress); the current key would move it back, so it is not uploaded"));
+  assert.equal(gh.uploads().length, n);
+  assert.equal(held(), seedSecret(trust.seeds.models.next));
+  // one next-signed document is enough: the index alone, with the withdrawn document still under the current key
+  const d = scratch(t, "data");
+  plant(d, "packs", { seed: trust.seeds.packs.next, keyId: "astra-packs-testb", serial: NOW - 30 });
+  gh.setState((st) => (st.data[documentPath("packs", "index")] = fs.readFileSync(path.join(d, documentPath("packs", "index")), "utf8")));
+  assert.ok((await secrets(t, trust, [dir], gh)).lines.some((l) => l.startsWith("refused: packs was last signed with its NEXT key")));
+  // rotating again is still allowed, and a document that cannot be read is not taken for "no rotation"
+  assert.equal((await secrets(t, trust, [dir, "--rotate", "models"], gh)).code, 0);
+  gh.setState((st) => (st.data[documentPath("models", "index")] = "{"));
+  await assert.rejects(secrets(t, trust, [dir], gh), /models's index on data is not JSON/);
+});
+
+test("owner/secrets gives gh its sign-in and nothing else of the environment", async (t) => {
+  const trust = throwawayTrust();
+  const gh = fakeGh(t);
+  const dir = keysDir(t, trust);
+  const r = await secrets(t, trust, [dir, "--rotate", "commands"], gh, { GH_TOKEN: "gh-token", GH_CONFIG_DIR: "/cfg", CONTENT_SIGNING_KEY: "canary", AWS_SECRET_ACCESS_KEY: "canary", SSH_AUTH_SOCK: "/s" });
+  assert.equal(r.code, 0);
+  const calls = gh.calls();
+  assert.ok(calls.length >= 5);
+  for (const c of calls) {
+    // Node adds nothing of its own to a child's environment; the stand-in records every name it was given
+    assert.deepEqual(c.env, ["GH_CONFIG_DIR", "GH_TOKEN", "HOME", "PATH"], c.argv.join(" "));
+  }
+});
+
+test("owner/create.sh: environments on main only, four rulesets, the two ids, and a second run changes nothing", (t) => {
+  const gh = fakeGh(t, { bare: true });
   const run = () => execFileSync("bash", [path.join(ROOT, "owner", "create.sh")], { env: { PATH: gh.path, HOME: gh.bin }, encoding: "utf8" });
   const out = run();
   const first = gh.state();
@@ -203,8 +325,14 @@ test("owner/create.sh: environments on main only, three rulesets, the two ids, a
     assert.deepEqual(env.policies, [{ name: "main", type: "branch" }], name);
   }
   const rules = Object.fromEntries(first.rulesets.map((r) => [r.name, r]));
-  assert.deepEqual(Object.keys(rules), ["main: no deletion, no forced update", "data: forward only", "data: written by the workflow only"]);
+  assert.deepEqual(Object.keys(rules), ["main: no deletion, no forced update", "main: updated by administrators only", "data: forward only", "data: written by the workflow only"]);
   const types = (r) => r.rules.map((x) => x.type);
+  // nobody forces or deletes main; and only an administrator updates it at all, which is what
+  // keeps a signing leg's own contents-write token from changing the code the next run executes
+  assert.deepEqual(rules["main: no deletion, no forced update"].bypass_actors, []);
+  assert.deepEqual(types(rules["main: updated by administrators only"]), ["update"]);
+  assert.deepEqual(rules["main: updated by administrators only"].conditions.ref_name, { include: ["refs/heads/main"], exclude: [] });
+  assert.deepEqual(rules["main: updated by administrators only"].bypass_actors, [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }]);
   assert.deepEqual(types(rules["main: no deletion, no forced update"]), ["deletion", "non_fast_forward"]);
   assert.deepEqual(rules["main: no deletion, no forced update"].conditions.ref_name.include, ["refs/heads/main"]);
   // nobody, the workflow included, may force or delete data
@@ -214,7 +342,7 @@ test("owner/create.sh: environments on main only, three rulesets, the two ids, a
   assert.deepEqual(types(rules["data: written by the workflow only"]), ["creation", "update"]);
   assert.deepEqual(rules["data: written by the workflow only"].bypass_actors, [{ actor_id: 15368, actor_type: "Integration", bypass_mode: "always" }]);
   for (const r of first.rulesets) assert.equal(r.enforcement, "active");
-  assert.match(out, /repository_id {8}1000000001\nrepository_owner_id {2}2000000002\n$/);
+  assert.ok(out.endsWith(`repository_id        ${REPOSITORY_ID}\nrepository_owner_id  ${REPOSITORY_OWNER_ID}\n`), "the two ids the service pins, which are also the ones compiled here");
 
   const calls = gh.calls().length;
   assert.equal(run(), out);
