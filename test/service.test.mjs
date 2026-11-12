@@ -11,8 +11,9 @@ import { test } from "node:test";
 
 import { main as fetchMain } from "../bin/fetch.mjs";
 import { KINDS } from "../lib/kinds.mjs";
-import { AUDIENCE, fetchAll, serviceBase } from "../lib/service.mjs";
-import { exportOf, scratch } from "./helpers.mjs";
+import { CLOSED_MAX_AGE, MAX_EXPORT_BYTES } from "../lib/kinds.mjs";
+import { AUDIENCE, fetchAll, SERVICE_BASE } from "../lib/service.mjs";
+import { exportOf, NOW, plant, scratch, throwawayTrust } from "./helpers.mjs";
 
 const ENV = { ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.invalid/token?v=1", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "request-token" };
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -31,6 +32,8 @@ function fakeFetch(door) {
     const m = /^\/plugins\/v1\/bot\/content\/([a-z]+)\/accepted$/.exec(u.pathname);
     assert.ok(m, `an unexpected path ${u.pathname}`);
     assert.equal(init.method, "GET");
+    assert.equal(init.redirect, "error", "a redirect would carry the bearer to another host");
+    assert.equal(u.origin, "https://api.minice.ai");
     assert.equal(init.body, undefined, "the signer sends the token only");
     calls.doors.push({ kind: m[1], bearer: init.headers.Authorization });
     return door(m[1]);
@@ -50,7 +53,7 @@ test("each kind is asked at its door with a token of its own, minted for the con
   assert.equal(new Set(calls.doors.map((d) => d.bearer)).size, KINDS.length);
 });
 
-test("a door that is not open ends the run green, and is asked once", async (t) => {
+test("a door that is not open is quiet for a kind that was never published", async (t) => {
   for (const [name, answer] of [
     ["404", () => new Response("not found", { status: 404 })],
     ["unavailable", () => json(503, { error: "unavailable" })],
@@ -58,15 +61,52 @@ test("a door that is not open ends the run green, and is asked once", async (t) 
   ]) {
     const { impl, calls } = fakeFetch(answer);
     const out = scratch(t);
+    const data = scratch(t, "data");
     const outputs = path.join(out, "outputs");
     const lines = [];
-    const work = await fetchMain(["--out", out], { env: { ...ENV, GITHUB_OUTPUT: outputs }, fetchImpl: impl, log: (l) => lines.push(l) });
+    const work = await fetchMain(["--out", out, "--data", data], { env: { ...ENV, GITHUB_OUTPUT: outputs }, fetchImpl: impl, log: (l) => lines.push(l), now: NOW });
     assert.deepEqual(work.kinds, Object.fromEntries(KINDS.map((k) => [k, "closed"])), name);
-    assert.equal(calls.doors.length, 1, `${name}: the other four kinds are not asked`);
+    assert.equal(calls.doors.length, KINDS.length, `${name}: each kind is asked for itself`);
     assert.equal(fs.readFileSync(outputs, "utf8"), "todo=false\nfailed=false\n", name);
     assert.ok(lines.some((l) => l.includes("service door not open")), name);
     assert.deepEqual(fs.readdirSync(out).sort(), ["outputs", "work.json"], `${name}: no export is written`);
   }
+});
+
+test("a door that stays shut fails the run for a kind published more than twelve hours ago, kind by kind", async (t) => {
+  const trust = throwawayTrust();
+  const data = scratch(t, "data");
+  const put = (kind, age) => plant(data, kind, { seed: trust.seeds[kind].current, keyId: `astra-${kind}-testa`, serial: NOW - age });
+  put("commands", CLOSED_MAX_AGE + 1); // overdue
+  put("characters", CLOSED_MAX_AGE); // still inside the twelve hours
+  put("models", 600);
+  put("animsets", 86400 * 3);
+  fs.writeFileSync(path.join(data, "registry", "v1", "animsets", "withdrawn.json"), "{"); // published, and unreadable
+  // packs: never published. The door answers for models only.
+  const { impl } = fakeFetch((kind) => (kind === "models" ? json(200, exportOf(kind)) : new Response("", { status: 404 })));
+  const out = scratch(t);
+  const outputs = path.join(out, "outputs");
+  const lines = [];
+  const work = await fetchMain(["--out", out, "--data", data], { env: { ...ENV, GITHUB_OUTPUT: outputs }, fetchImpl: impl, log: (l) => lines.push(l), now: NOW });
+  assert.deepEqual(work.kinds, { commands: "overdue", characters: "closed", models: "fetched", animsets: "overdue", packs: "closed" });
+  assert.equal(fs.readFileSync(outputs, "utf8"), "todo=true\nfailed=true\n", "the run fails, and the kind that was answered is still handed on");
+  assert.ok(lines.some((l) => l.startsWith("commands: service door not open (HTTP 404) and the kind was last signed 43201 s ago")));
+
+  // only kinds inside the twelve hours or never published: quiet
+  put("commands", 3600);
+  fs.rmSync(path.join(data, "registry", "v1", "animsets"), { recursive: true });
+  fs.rmSync(path.join(data, "state", "animsets.json"));
+  const closed = fakeFetch(() => new Response("", { status: 404 }));
+  const out2 = scratch(t);
+  const work2 = await fetchMain(["--out", out2, "--data", data], { env: { ...ENV, GITHUB_OUTPUT: path.join(out2, "outputs") }, fetchImpl: closed.impl, log: () => {}, now: NOW });
+  assert.deepEqual(Object.values(work2.kinds), KINDS.map(() => "closed"));
+  assert.equal(fs.readFileSync(path.join(out2, "outputs"), "utf8"), "todo=false\nfailed=false\n");
+  // a kind with a state file and no documents was published too
+  fs.mkdirSync(path.join(data, "state"), { recursive: true });
+  fs.writeFileSync(path.join(data, "state", "packs.json"), "{}");
+  const out3 = scratch(t);
+  const work3 = await fetchMain(["--out", out3, "--data", data], { env: { ...ENV, GITHUB_OUTPUT: path.join(out3, "outputs") }, fetchImpl: closed.impl, log: () => {}, now: NOW });
+  assert.equal(work3.kinds.packs, "overdue");
 });
 
 test("a refused call fails the run and still hands on the kinds that were answered", async (t) => {
@@ -74,7 +114,7 @@ test("a refused call fails the run and still hands on the kinds that were answer
   const out = scratch(t);
   const outputs = path.join(out, "outputs");
   const lines = [];
-  const work = await fetchMain(["--out", out], { env: { ...ENV, GITHUB_OUTPUT: outputs }, fetchImpl: impl, log: (l) => lines.push(l) });
+  const work = await fetchMain(["--out", out, "--data", scratch(t, "data")], { env: { ...ENV, GITHUB_OUTPUT: outputs }, fetchImpl: impl, log: (l) => lines.push(l), now: NOW });
   assert.equal(work.kinds.models, "refused");
   assert.equal(work.kinds.commands, "fetched");
   assert.equal(work.kinds.packs, "fetched");
@@ -102,7 +142,10 @@ test("other answers are refusals, not a closed door", async () => {
     const got = await fetchAll({ env: ENV, fetchImpl: impl });
     assert.equal(got.commands.status, "refused", `HTTP ${status}`);
   }
-  const big = fakeFetch(() => new Response(Buffer.alloc(4 * 1048576 + 1, 0x20), { status: 200 }));
+  const big = fakeFetch(() => new Response(Buffer.alloc(MAX_EXPORT_BYTES + 1, 0x20), { status: 200 }));
+  assert.equal(MAX_EXPORT_BYTES, 4 * 1048576);
+  const fits = fakeFetch(() => new Response(Buffer.alloc(MAX_EXPORT_BYTES, 0x20), { status: 200 }));
+  assert.equal((await fetchAll({ env: ENV, fetchImpl: fits.impl })).commands.status, "fetched");
   assert.equal((await fetchAll({ env: ENV, fetchImpl: big.impl })).commands.status, "refused");
   const down = fakeFetch(() => {
     throw new TypeError("fetch failed");
@@ -110,11 +153,11 @@ test("other answers are refusals, not a closed door", async () => {
   assert.equal((await fetchAll({ env: ENV, fetchImpl: down.impl })).commands.status, "refused");
 });
 
-test("the service base is a plain https URL, and a job without id-token cannot ask", async () => {
-  assert.equal(serviceBase({}), "https://api.minice.ai/plugins/v1");
-  assert.equal(serviceBase({ CONTENT_SERVICE_URL: "https://stand.example/plugins/v1/" }), "https://stand.example/plugins/v1");
-  for (const bad of ["http://api.minice.ai/plugins/v1", "https://user:pw@api.minice.ai/x", "https://api.minice.ai/x?y=1", "nonsense"]) {
-    assert.throws(() => serviceBase({ CONTENT_SERVICE_URL: bad }), /CONTENT_SERVICE_URL/);
-  }
+test("the bearer goes to one compiled base, whatever the environment says", async () => {
+  assert.equal(SERVICE_BASE, "https://api.minice.ai/plugins/v1");
+  // the token is this repository's identity at the service: no variable may send it elsewhere
+  const { impl, calls } = fakeFetch((kind) => json(200, exportOf(kind)));
+  await fetchAll({ env: { ...ENV, CONTENT_SERVICE_URL: "https://elsewhere.example/plugins/v1", GAMES_SERVICE_URL: "https://elsewhere.example" }, fetchImpl: impl });
+  assert.equal(calls.doors.length, KINDS.length, "every call went to the compiled host (the fetch above refuses any other)");
   await assert.rejects(fetchAll({ env: {}, fetchImpl: async () => json(200, {}) }), /id-token: write/);
 });
