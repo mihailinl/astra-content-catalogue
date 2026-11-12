@@ -325,8 +325,10 @@ test("owner/secrets gives gh its sign-in and nothing else of the environment", a
   }
 });
 
-test("owner/create.sh: environments on main only, four rulesets, the two ids, and a second run changes nothing", (t) => {
+test("owner/create.sh: environments on main only, the rulesets, the two ids, and a second run changes nothing", (t) => {
   const gh = fakeGh(t, { bare: true });
+  // an organisation's repository: the fourth ruleset, with GitHub Actions as its one bypass actor
+  fs.writeFileSync(path.join(gh.bin, "state.json"), JSON.stringify({ environments: {}, rulesets: [], secrets: {}, data: {}, nextId: 1, ownerType: "Organization" }));
   const run = () => execFileSync("bash", [path.join(ROOT, "owner", "create.sh")], { env: { PATH: gh.path, HOME: gh.bin }, encoding: "utf8" });
   const out = run();
   const first = gh.state();
@@ -361,6 +363,19 @@ test("owner/create.sh: environments on main only, four rulesets, the two ids, an
   const second = gh.calls().slice(calls);
   assert.ok(!second.some((c) => c.argv.includes("POST")), "and creates nothing a second time");
   assert.ok(!gh.calls().some((c) => c.argv[0] === "secret"), "create.sh never touches a secret");
+
+  // a personal account's repository (this one): GitHub refuses an app as a bypass actor there,
+  // so the fourth ruleset is not attempted, the script says why, and the other three are set
+  {
+    const user = fakeGh(t, { bare: true });
+    const run2 = () => execFileSync("bash", [path.join(ROOT, "owner", "create.sh")], { env: { PATH: user.path, HOME: user.bin }, encoding: "utf8" });
+    const said = run2();
+    assert.deepEqual(user.state().rulesets.map((r) => r.name), ["main: no deletion, no forced update", "main: updated by administrators only", "data: forward only"]);
+    assert.match(said, /ruleset "data: written by the workflow only": not set; the repository is owned by a personal account \(owner type User\)/);
+    const before = user.state();
+    assert.equal(run2(), said, "and a second run says the same");
+    assert.deepEqual(user.state(), before);
+  }
 
   // an environment that also allows another branch stops the script
   const state = gh.state();

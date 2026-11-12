@@ -254,9 +254,9 @@ the environment holds; from then on the pair on `data` verifies and the
 entry matches nothing, so remove it in a later commit. Nothing is lost.
 
 **`E_PREVIOUS_MISSING`, or an `E_PREVIOUS_UNVERIFIED` pair that the workflow
-did not write.** Somebody wrote `data`, which only the workflow may. Treat it
-as a compromise of whatever could write it (the `publish` job's token, or an
-administrator's account) and deal with that first. Then put the kind's last
+did not write.** Somebody other than the workflow wrote `data`. Treat it as
+a compromise of whatever could write it (the `publish` job's token, or the
+account of somebody who can push this repository) and deal with that first. Then put the kind's last
 pair the workflow signed back, as a new commit on top: `data` moves forward
 only, and a forced update stays refused for everybody.
 
@@ -264,21 +264,24 @@ only, and a forced update stays refused for everybody.
 GOOD=<the last commit by astra-content-catalogue that signed K>
 git checkout "$GOOD" -- "registry/v1/$K" "state/$K.json"
 git -c user.name=operator -c user.email=operator@invalid commit -m "restore $K as signed at $GOOD"
-ID=$(gh api "repos/$REPO/rulesets" --jq '.[] | select(.name == "data: written by the workflow only") | .id')
-gh api --method PUT "repos/$REPO/rulesets/$ID" -f enforcement=disabled   # only this one: "data: forward only" stays on
 git push origin HEAD:data
-gh api --method PUT "repos/$REPO/rulesets/$ID" -f enforcement=active
-gh api "repos/$REPO/rulesets/$ID" --jq .enforcement                       # must print: active
 ```
 
-Running `owner/create.sh` again also sets the ruleset back to `active`.
-While it is disabled, anybody with write access can push `data` forward, so
-keep the window to these three commands. What is lost: nothing the workflow
-signed. The restored pair is the one the service last accepted, so its
-serial is the service's floor and the next run signs above it; any commit
-written in between is left in history and not served. If the restored pair
-no longer verifies (a key ceremony happened since), follow the first case
-for it as well.
+This repository belongs to a personal account, so `data` carries only the
+ruleset `data: forward only`, and anybody who can push the repository pushes
+that commit as it is; no ruleset is touched. (Owned by an organisation,
+`owner/create.sh` also sets `data: written by the workflow only`; then
+disable that one ruleset around the push, with
+`gh api --method PUT "repos/$REPO/rulesets/$ID" -f enforcement=disabled` and
+`-f enforcement=active` after, where `ID` is its id from
+`gh api "repos/$REPO/rulesets"`, or run `owner/create.sh` again to set it
+back.)
+
+What is lost: nothing the workflow signed. The restored pair is the one the
+service last accepted, so its serial is the service's floor and the next run
+signs above it; any commit written in between is left in history and not
+served. If the restored pair no longer verifies (a key ceremony happened
+since), follow the first case for it as well.
 
 ## What protects the keys, and what GitHub cannot enforce
 
@@ -287,7 +290,8 @@ for it as well.
 | a kind's key is read only by that kind's `sign` job | the secret belongs to the environment `publish-<kind>`; an environment deploys from the branch `main` only |
 | the code that job runs is the reviewed code on `main` | the ruleset `main: updated by administrators only`; the job checks out the run's own commit afresh |
 | nothing an earlier job did reaches the key job but its artifact | jobs run on separate runners; the key job admits the artifact file by file and reads nothing else; no job writes `GITHUB_ENV` or `GITHUB_PATH` |
-| `data` is written only by the workflow, forward only | two rulesets on `data` |
+| `data` only moves forward | the ruleset `data: forward only`; no bypass, the workflow and administrators included |
+| `data` is written only by the workflow | not enforced on this repository: see "What remains" |
 | the service is asked only by this workflow on `main` | the service pins the token's repository id, workflow, ref and environment |
 
 Two things GitHub does not offer, and what stands in for them:
@@ -330,6 +334,19 @@ still stands beside the key:
   repository, so a document signed and then refused by `publish` can still
   be fetched from there; the service and every client apply the same rules
   to it and refuse it the same way.
+- **Who can push `data`.** GitHub accepts no app as a ruleset's bypass
+  actor on a repository owned by a personal account, so the ruleset that
+  would let only the workflow write `data` cannot be set here
+  (`owner/create.sh` says so and sets the other three). Besides the
+  workflow's `publish` job, whoever can push this repository (today: its
+  owner alone) can move `data` forward; nobody can force it or delete it.
+  That costs availability at most, never a forged document: every byte the
+  service serves from `data` must verify under the kind's keys in the
+  root-signed `trust.json`, and the signer itself builds only on a pair
+  that verifies. An older valid pair pushed back is a rollback, and the
+  service's serial floor per document (SERVE-116) refuses it and alarms. A
+  deploy key would close this at the price of one more secret to guard; it
+  is not used.
 - **Two compromises together.** An attacker who can write `data` *and*
   controls the service can put an older pair of a kind back on `data` (it
   verifies: it was signed here) and have the service omit the withdrawn

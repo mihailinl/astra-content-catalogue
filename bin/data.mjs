@@ -47,7 +47,7 @@ function run(argv, { env = process.env, log = console.log } = {}) {
   if (mode === "open") {
     const args = parseArgs(rest, ["dir"], ["remote"]);
     const r = openData({ remote: remoteOf(args, env), dir: args.dir, token });
-    log(r.exists ? `data is at ${r.head}` : "data does not exist yet; this run starts it");
+    log(r.exists ? `data is at ${r.head}` : "data does not exist yet; the first kind published starts it");
     return 0;
   }
   if (mode === "publish") {

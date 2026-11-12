@@ -36,6 +36,13 @@
 #                  pushes it. The two are separate rulesets because a bypass
 #                  actor bypasses every rule of the ruleset it is listed on,
 #                  and the workflow must not be able to force or delete.
+#                  ONLY for a repository owned by an organisation: GitHub
+#                  refuses an app as a bypass actor on a repository owned by
+#                  a personal account (HTTP 422). There the second ruleset is
+#                  not attempted, the script says so, and whoever can push
+#                  the repository can push `data` forward (README, "What
+#                  remains": availability only, every byte on `data` is
+#                  signed and the service keeps its own serial floor).
 set -euo pipefail
 
 REPO="${1:-mihailinl/astra-content-catalogue}"
@@ -103,12 +110,17 @@ ruleset "data: forward only" '{
   "bypass_actors": [],
   "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}]
 }'
+OWNER_TYPE="$(api "repos/$REPO" --jq .owner.type)"
+if [ "$OWNER_TYPE" = "Organization" ]; then
 ruleset "data: written by the workflow only" '{
   "name": "data: written by the workflow only", "target": "branch", "enforcement": "active",
   "conditions": {"ref_name": {"include": ["refs/heads/data"], "exclude": []}},
   "bypass_actors": [{"actor_id": '"$ACTIONS_APP_ID"', "actor_type": "Integration", "bypass_mode": "always"}],
   "rules": [{"type": "creation"}, {"type": "update"}]
 }'
+else
+  echo "ruleset \"data: written by the workflow only\": not set; the repository is owned by a personal account (owner type $OWNER_TYPE), where GitHub accepts no app as a bypass actor. Anyone who can push the repository can move data forward; every byte on it is signed (README, \"What remains\")."
+fi
 
 echo
 echo "The plugins service pins these two ids (contract BOT-110):"

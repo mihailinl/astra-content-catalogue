@@ -115,6 +115,7 @@ if (argv[0] === "api") {
   if ((m = /^repos\/([^/]+\/[^/]+)$/.exec(route)) && method === "GET") {
     const id = REPO_ID[m[1]] ?? 999;
     if (jq === null) done(JSON.stringify({ id, owner: { id: 193032699 }, default_branch: state.defaultBranch ?? "main" }));
+    if (jq === ".owner.type") done(state.ownerType ?? "User");
     if (jq !== '"repository_id        \\(.id)\\nrepository_owner_id  \\(.owner.id)"') fail("an unmodelled --jq");
     done(`repository_id        ${id}\nrepository_owner_id  193032699`);
   }
