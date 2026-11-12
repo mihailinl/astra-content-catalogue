@@ -38,11 +38,11 @@ export async function main(argv, { env = process.env, fetchImpl = fetch, token =
   const statuses = Object.values(work.kinds);
   const todo = statuses.includes("fetched");
   const failed = statuses.includes("refused");
-  appendTo("GITHUB_OUTPUT", `todo=${todo}`, env, fs);
-  appendTo("GITHUB_OUTPUT", `failed=${failed}`, env, fs);
+  appendTo("GITHUB_OUTPUT", `todo=${todo}`, env);
+  appendTo("GITHUB_OUTPUT", `failed=${failed}`, env);
   if (!todo && !failed) {
     log("service door not open: nothing is signed, and every kind keeps its last signed documents");
-    appendTo("GITHUB_STEP_SUMMARY", "Service door not open. Nothing was signed; the next run asks again.", env, fs);
+    appendTo("GITHUB_STEP_SUMMARY", "Service door not open. Nothing was signed; the next run asks again.", env);
   }
   return work;
 }

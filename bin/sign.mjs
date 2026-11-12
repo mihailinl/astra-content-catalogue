@@ -66,7 +66,7 @@ export function main(argv, { env = process.env, now = Math.floor(Date.now() / 10
           ? `${kind}: service door not open`
           : `${kind}: not signed (${report.code}); the last signed documents stay`;
   log(line);
-  appendTo("GITHUB_STEP_SUMMARY", line, env, fs);
+  appendTo("GITHUB_STEP_SUMMARY", line, env);
   return report;
 }
 
