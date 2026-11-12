@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Minice — https://minice.ai
+#
+# The tests, and the check that the vendored checker, schemas, goldens and
+# signing code still equal the upstream commits vendor/pins.json records.
+# No secret and no environment: this workflow can sign nothing.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out AstraPlugins (the source of the vendored checker and goldens)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mihailinl/AstraPlugins
+          path: upstream/astraplugins
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out astra-registry (the source of the vendored signing code)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mihailinl/astra-registry
+          path: upstream/astra-registry
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Tests
+        env:
+          ASTRAPLUGINS_CHECKOUT: ${{ github.workspace }}/upstream/astraplugins
+          ASTRA_REGISTRY_CHECKOUT: ${{ github.workspace }}/upstream/astra-registry
+        run: node --test test/
+
+      - name: The owner's scripts parse
+        run: bash -n owner/create.sh && bash -n owner/secrets.sh

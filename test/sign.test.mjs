@@ -1,0 +1,375 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Minice — https://minice.ai
+//
+// The signing of one kind (lib/pipeline.mjs). No network: the answers are
+// built here or taken from the specification's goldens.
+
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { test } from "node:test";
+
+import { jcs } from "../vendor/astra-registry/tools/lib/canonical.mjs";
+import { carryRows, lifts } from "../lib/carry.mjs";
+import { checkDocument } from "../lib/checker.mjs";
+import { DOCS, documentPath, KINDS, MAX_DOCUMENT_BYTES, Refused, RESIGN_AFTER, statePath } from "../lib/kinds.mjs";
+import { signKind } from "../lib/pipeline.mjs";
+import { exportOf, golden, GOLDENS, goldenTrust, NOW, scratch, seedSecret, snapshot, testSeed, throwawayTrust, writeExport } from "./helpers.mjs";
+
+const read = (dir, kind, doc) => JSON.parse(fs.readFileSync(path.join(dir, documentPath(kind, doc)), "utf8"));
+const refusal = (code) => (e) => e instanceof Refused && e.code === code;
+
+/** One run of the pipeline over a built answer, under throwaway keys unless told otherwise. */
+function run(t, o) {
+  const dir = o.dir ?? scratch(t);
+  const dataDir = o.dataDir ?? path.join(dir, "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  const exportFile = writeExport(dir, o.kind, o.export, { raw: o.raw ?? null });
+  return signKind({ kind: o.kind, exportFile, dataDir, trust: o.trust, secret: o.secret, now: o.now ?? NOW, tmpDir: dir });
+}
+
+test("a golden round trip: the signer reproduces every valid golden, and the vendored verifier accepts it", (t) => {
+  const { trust } = goldenTrust();
+  for (const kind of KINDS) {
+    const dir = scratch(t, kind);
+    const dataDir = path.join(dir, "data");
+    const want = { index: golden(`index/${kind}/valid.json`), withdrawn: golden(`withdrawn/${kind}/valid.json`) };
+    const answer = exportOf(kind, { entries: want.index.signed.entries, rows: want.withdrawn.signed.rows, lifts: want.withdrawn.signed.lifts });
+    const report = run(t, { dir, dataDir, kind, export: answer, trust, secret: seedSecret(testSeed(`astra-${kind}-2026a`)) });
+    assert.equal(report.outcome, "signed");
+    assert.equal(report.carried, 0);
+    for (const doc of DOCS) {
+      const got = read(dataDir, kind, doc);
+      // Ed25519 is deterministic: the same body under the same key is the same signature
+      assert.deepEqual(got.signed, want[doc].signed, `${kind} ${doc}: the signed body`);
+      assert.deepEqual(got.signatures, want[doc].signatures, `${kind} ${doc}: the signature`);
+      const verdict = checkDocument({ file: path.join(dataDir, documentPath(kind, doc)), kind, doc, now: NOW, trust: trust.signed });
+      assert.deepEqual(verdict.verified_by, [`astra-${kind}-2026a`], `${kind} ${doc}: verified by the current key`);
+      assert.equal(verdict.ok, true);
+      // and under no other kind's keys, nor as the other document of its own kind
+      const other = KINDS[(KINDS.indexOf(kind) + 1) % KINDS.length];
+      assert.equal(checkDocument({ file: path.join(dataDir, documentPath(kind, doc)), kind: other, doc, now: NOW, trust: trust.signed }).ok, false);
+    }
+    const state = JSON.parse(fs.readFileSync(path.join(dataDir, statePath(kind)), "utf8"));
+    assert.deepEqual(state, { schema: "astra.content.signer-state/1", kind, state_sha256: answer.state_sha256, issued_at: NOW, key_id: `astra-${kind}-2026a`, carried: 0 });
+  }
+});
+
+test("the published bytes are canonical JSON and the same for the same input", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const entries = golden("index/commands/valid.json").signed.entries;
+  const bytes = [entries, [...entries]].map((e) => {
+    const dir = scratch(t);
+    run(t, { dir, kind: "commands", export: exportOf("commands", { entries: e }), trust, secret: seedSecret(seeds.commands.current) });
+    return fs.readFileSync(path.join(dir, "data", documentPath("commands", "index")));
+  });
+  assert.ok(bytes[0].equals(bytes[1]));
+  const text = bytes[0].toString("utf8");
+  assert.ok(text.startsWith('{"signatures":[{"key_id":"astra-commands-testa","sig":"'), "members in code-unit order, no whitespace");
+  assert.ok(!/\s$/.test(text));
+});
+
+// The specification's own sequence: a security row is published (seq-1), the
+// next answer leaves it out (seq-2), the next lifts it at the wrong second
+// (seq-3), the last lifts it exactly (seq-4).
+const seq = (n) => golden(`withdrawn/commands/${n}.json`).signed;
+
+test("a_dropped_row_is_carried", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const dir = scratch(t);
+  const dataDir = path.join(dir, "data");
+  const base = { dir, dataDir, kind: "commands", trust, secret: seedSecret(seeds.commands.current) };
+  const row = seq("seq-1-security").rows[0];
+
+  assert.equal(run(t, { ...base, export: exportOf("commands", { rows: seq("seq-1-security").rows }), now: NOW }).carried, 0);
+
+  // the answer drops the row and says nothing about it
+  const dropped = run(t, { ...base, export: exportOf("commands", { rows: seq("seq-2-row-dropped").rows }), now: NOW + 3600 });
+  assert.equal(dropped.outcome, "signed", "the kept row is published");
+  assert.equal(dropped.carried, 1, "and the run is marked to fail");
+  assert.deepEqual(read(dataDir, "commands", "withdrawn").signed.rows, [row]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, statePath("commands")), "utf8")).carried, 1);
+
+  // the same answer again inside six hours: nothing is signed, and the run is still marked
+  const again = run(t, { ...base, export: exportOf("commands", { rows: [] }), now: NOW + 3700 });
+  assert.equal(again.outcome, "unchanged");
+  assert.equal(again.carried, 1);
+
+  // a row the answer states itself is not counted twice
+  const restated = run(t, { ...base, export: exportOf("commands", { rows: [row], state: "a".repeat(64) }), now: NOW + 3800 });
+  assert.equal(restated.carried, 0);
+  assert.deepEqual(read(dataDir, "commands", "withdrawn").signed.rows, [row]);
+
+  // an answer that brings a new row and drops the old one keeps both, the answer's first
+  const fresh = { ...row, id: "another-item", at: row.at + 5 };
+  const both = run(t, { ...base, export: exportOf("commands", { rows: [fresh] }), now: NOW + 3900 });
+  assert.equal(both.carried, 1);
+  assert.deepEqual(read(dataDir, "commands", "withdrawn").signed.rows, [fresh, row]);
+});
+
+test("a_lift_matches_its_row_by_strings", (t) => {
+  const row = seq("seq-1-security").rows[0];
+  const exact = seq("seq-4-lift").lifts[0];
+  assert.equal(lifts(exact, row), true);
+  assert.equal(lifts(seq("seq-3-lift-wrong-at").lifts[0], row), false, "one second off is another decision");
+  assert.equal(lifts({ ...exact, id: "evil-shell-2" }, row), false);
+  // the same versions, spelt another way: not this row's lift
+  assert.equal(lifts({ ...exact, versions: ">=0.0.0,<=1.0.0" }, row), false);
+  assert.equal(lifts({ ...exact, versions: "<1.0.1" }, row), false);
+  assert.equal(lifts({ ...exact, lifts_at: String(row.at) }, row), false, "a second is a number");
+  assert.deepEqual(carryRows({ previousRows: [row], rows: [], lifts: [exact] }), { rows: [], carried: [] });
+
+  const { trust, seeds } = throwawayTrust();
+  const dir = scratch(t);
+  const dataDir = path.join(dir, "data");
+  const base = { dir, dataDir, kind: "commands", trust, secret: seedSecret(seeds.commands.current) };
+  run(t, { ...base, export: exportOf("commands", { rows: [row] }), now: NOW });
+
+  const wrongAt = run(t, { ...base, export: exportOf("commands", { lifts: seq("seq-3-lift-wrong-at").lifts }), now: NOW + 10 });
+  assert.equal(wrongAt.carried, 1, "a lift at another second lifts nothing");
+  assert.deepEqual(read(dataDir, "commands", "withdrawn").signed.rows, [row]);
+
+  const respelt = run(t, { ...base, export: exportOf("commands", { lifts: [{ ...exact, versions: ">=0.0.0,<=1.0.0" }] }), now: NOW + 20 });
+  assert.equal(respelt.carried, 1, "a lift over an equal range spelt differently lifts nothing");
+
+  const lifted = run(t, { ...base, export: exportOf("commands", { lifts: [exact] }), now: NOW + 30 });
+  assert.equal(lifted.carried, 0);
+  assert.deepEqual(read(dataDir, "commands", "withdrawn").signed, { ...read(dataDir, "commands", "withdrawn").signed, rows: [], lifts: [exact] });
+});
+
+test("serial_never_goes_back", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const dir = scratch(t);
+  const dataDir = path.join(dir, "data");
+  const base = { dir, dataDir, kind: "models", trust, secret: seedSecret(seeds.models.current) };
+  const entries = golden("index/models/valid.json").signed.entries;
+  run(t, { ...base, export: exportOf("models", { entries }), now: NOW });
+  const before = snapshot(dataDir);
+  const changed = exportOf("models", { entries: [] });
+
+  for (const now of [NOW, NOW - 1, NOW - 86400]) {
+    assert.throws(() => run(t, { ...base, export: changed, now }), refusal("E_SERIAL_BACK"), `a clock at ${now - NOW}s`);
+    assert.deepEqual(snapshot(dataDir), before, "and the last pair is untouched");
+  }
+  // the floor is each document's own serial, not only the state file's word for it
+  fs.rmSync(path.join(dataDir, statePath("models")));
+  assert.throws(() => run(t, { ...base, export: changed, now: NOW }), refusal("E_SERIAL_BACK"));
+
+  const next = run(t, { ...base, export: changed, now: NOW + 1 });
+  assert.equal(next.issued_at, NOW + 1);
+  for (const doc of DOCS) {
+    const s = read(dataDir, "models", doc).signed;
+    assert.equal(s.serial, NOW + 1);
+    assert.equal(s.issued_at, s.serial);
+    assert.equal(s.expires_at, s.issued_at + 7 * 86400);
+  }
+});
+
+test("over_one_mebibyte_is_not_signed", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const dir = scratch(t);
+  const dataDir = path.join(dir, "data");
+  const base = { dir, dataDir, kind: "commands", trust, secret: seedSecret(seeds.commands.current) };
+  const entry = golden("index/commands/valid.json").signed.entries[0];
+  const many = (n) => Array.from({ length: n }, (_, i) => ({ ...entry, id: `item-${i}` }));
+  const one = Buffer.byteLength(jcs({ ...entry, id: "item-1000" })) + 1;
+
+  run(t, { ...base, export: exportOf("commands", { entries: many(3) }), now: NOW });
+  const before = snapshot(dataDir);
+
+  const over = Math.ceil(MAX_DOCUMENT_BYTES / one) + 2;
+  assert.throws(() => run(t, { ...base, export: exportOf("commands", { entries: many(over) }), now: NOW + 10 }), refusal("E_DOCUMENT_SIZE"));
+  assert.deepEqual(snapshot(dataDir), before, "the last signed pair stays");
+
+  // the withdrawn document has the same bound
+  const row = { ...seq("seq-1-security").rows[0], reason_text: "x".repeat(500) };
+  const rows = Array.from({ length: 1800 }, (_, i) => ({ ...row, id: `item-${i}` }));
+  assert.throws(() => run(t, { ...base, export: exportOf("commands", { rows }), now: NOW + 20 }), refusal("E_DOCUMENT_SIZE"));
+  assert.deepEqual(snapshot(dataDir), before);
+
+  // just under the bound is signed, and what is published is within it
+  const under = Math.floor((MAX_DOCUMENT_BYTES - 4096) / one);
+  const ok = run(t, { ...base, export: exportOf("commands", { entries: many(under) }), now: NOW + 30 });
+  assert.equal(ok.outcome, "signed");
+  assert.ok(ok.bytes.index <= MAX_DOCUMENT_BYTES && ok.bytes.index > MAX_DOCUMENT_BYTES - 8192, `${ok.bytes.index} bytes`);
+  assert.equal(fs.statSync(path.join(dataDir, documentPath("commands", "index"))).size, ok.bytes.index);
+});
+
+test("the_signer_signs_with_the_current_key_only", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const answer = exportOf("packs", { entries: golden("index/packs/valid.json").signed.entries });
+  const attempt = (secret) => {
+    const dir = scratch(t);
+    const report = run(t, { dir, kind: "packs", export: answer, trust, secret });
+    return { report, dir: path.join(dir, "data") };
+  };
+  const nothing = (secret, code) => {
+    const dir = scratch(t);
+    assert.throws(() => run(t, { dir, kind: "packs", export: answer, trust, secret }), refusal(code));
+    assert.deepEqual(snapshot(path.join(dir, "data")), {}, `${code}: nothing is written`);
+  };
+
+  nothing(seedSecret(seeds.packs.next), "E_KEY_IS_NEXT");
+  nothing(seedSecret(seeds.models.current), "E_KEY_NOT_CURRENT");
+  nothing(seedSecret(crypto.randomBytes(32)), "E_KEY_NOT_CURRENT");
+  nothing(undefined, "E_KEY_ABSENT");
+  nothing("  \n", "E_KEY_ABSENT");
+  nothing("not a key", "E_KEY_FORMAT");
+  nothing(crypto.randomBytes(31).toString("base64"), "E_KEY_FORMAT");
+
+  const { dir } = attempt(seedSecret(seeds.packs.current));
+  for (const doc of DOCS) {
+    const env = read(dir, "packs", doc);
+    assert.deepEqual(env.signatures.map((s) => s.key_id), ["astra-packs-testa"], `${doc}: one signature, by the current key`);
+    const verdict = checkDocument({ file: path.join(dir, documentPath("packs", doc)), kind: "packs", doc, now: NOW, trust: trust.signed });
+    assert.deepEqual(verdict.verified_by, ["astra-packs-testa"]);
+  }
+  // the same key as a PKCS#8 PEM, with the newline a file ends in
+  const pem = crypto
+    .createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seeds.packs.current]), format: "der", type: "pkcs8" })
+    .export({ format: "pem", type: "pkcs8" });
+  assert.equal(attempt(`${pem}\n`).report.key_id, "astra-packs-testa");
+  assert.equal(attempt(`${seedSecret(seeds.packs.current)}\n`).report.outcome, "signed");
+
+  // a current key that is not valid yet signs nothing either
+  const early = throwawayTrust({ now: NOW + 40 * 86400 });
+  const dir2 = scratch(t);
+  assert.throws(() => run(t, { dir: dir2, kind: "packs", export: answer, trust: early.trust, secret: seedSecret(early.seeds.packs.current), now: NOW }), refusal("E_KEY_NOT_YET"));
+});
+
+test("an_export_with_an_account_fact_is_refused", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const entries = golden("index/commands/valid.json").signed.entries;
+  const w = golden("withdrawn/commands/valid.json").signed;
+  const good = () => structuredClone(exportOf("commands", { entries, rows: w.rows, lifts: w.lifts }));
+  const refused = (name, mutate, code) => {
+    const dir = scratch(t);
+    const answer = good();
+    mutate(answer);
+    assert.throws(() => run(t, { dir, kind: "commands", export: answer, trust, secret: seedSecret(seeds.commands.current) }), refusal(code), name);
+    assert.deepEqual(snapshot(path.join(dir, "data")), {}, `${name}: nothing is written`);
+  };
+  // the unchanged answer is signed, so each refusal below is the one member's doing
+  assert.equal(run(t, { kind: "commands", export: good(), trust, secret: seedSecret(seeds.commands.current) }).outcome, "signed");
+
+  refused("a member beside the six", (a) => (a.owner_account_id = "acc_1"), "E_EXPORT_MEMBER");
+  refused("a member with an empty value", (a) => (a.moderator = null), "E_EXPORT_MEMBER");
+  refused("a member inside withdrawn", (a) => (a.withdrawn.reports = []), "E_EXPORT_MEMBER");
+  refused("a member inside an entry", (a) => (a.entries[0].owner_account_id = "acc_1"), "E_DOCUMENT_REFUSED");
+  refused("a member inside an entry's author facts", (a) => (a.entries[0].thumbnail.uploader_email = "a@example.org"), "E_DOCUMENT_REFUSED");
+  refused("a member inside a row", (a) => (a.withdrawn.rows[0].moderator = "m"), "E_DOCUMENT_REFUSED");
+  refused("a member inside a lift", (a) => (a.withdrawn.lifts[0].note = "n"), "E_DOCUMENT_REFUSED");
+
+  refused("another kind's answer", (a) => (a.kind = "models"), "E_EXPORT_KIND");
+  refused("another schema", (a) => (a.schema = "astra.content.export/2"), "E_EXPORT_SHAPE");
+  refused("no lifts", (a) => delete a.withdrawn.lifts, "E_EXPORT_SHAPE");
+  refused("a state that is not a digest", (a) => (a.state_sha256 = "ABC"), "E_EXPORT_SHAPE");
+
+  // read strictly: a member named twice, and a number that is not an integer
+  const raw = (name, text, code) => {
+    const dir = scratch(t);
+    assert.throws(() => run(t, { dir, kind: "commands", raw: text, trust, secret: seedSecret(seeds.commands.current) }), refusal(code), name);
+  };
+  const text = JSON.stringify(good());
+  raw("a duplicate member name", text.replace('"kind":"commands"', '"kind":"models","kind":"commands"'), "E_EXPORT_PARSE");
+  raw("a fraction", text.replace(/"published_at":(\d+)/, '"published_at":$1.5'), "E_EXPORT_PARSE");
+  raw("not JSON", text.slice(0, -1), "E_EXPORT_PARSE");
+});
+
+test("a document the specification's checker refuses is not signed", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const base = { kind: "commands", trust, secret: seedSecret(seeds.commands.current) };
+  const row = seq("seq-1-security").rows[0];
+  const cases = {
+    "lift-not-contradicted": exportOf("commands", { rows: [row], lifts: [{ id: row.id, versions: row.versions, lifts_at: row.at }] }),
+    "security-pairs": exportOf("commands", { rows: [{ ...row, act: "retired", floor_effect: "disarm" }] }),
+    "unique-id-version": exportOf("commands", { entries: [1, 2].map(() => golden("index/commands/valid.json").signed.entries[0]) }),
+  };
+  for (const [rule, answer] of Object.entries(cases)) {
+    const dir = scratch(t);
+    assert.throws(
+      () => run(t, { ...base, dir, export: answer }),
+      (e) => e instanceof Refused && e.code === "E_DOCUMENT_REFUSED" && e.message.includes(rule),
+      rule,
+    );
+    assert.deepEqual(snapshot(path.join(dir, "data")), {});
+  }
+});
+
+test("an unchanged kind is signed again only after six hours, or under a new current key", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const dir = scratch(t);
+  const dataDir = path.join(dir, "data");
+  const base = { dir, dataDir, kind: "animsets", trust, secret: seedSecret(seeds.animsets.current) };
+  const answer = exportOf("animsets", { entries: golden("index/animsets/valid.json").signed.entries });
+  assert.equal(run(t, { ...base, export: answer, now: NOW }).outcome, "signed");
+  const first = snapshot(dataDir);
+
+  const soon = run(t, { ...base, export: { ...answer, generated_at: "2026-12-31T05:00:00Z" }, now: NOW + RESIGN_AFTER - 1 });
+  assert.deepEqual(soon, { kind: "animsets", outcome: "unchanged", issued_at: NOW, key_id: "astra-animsets-testa", carried: 0 });
+  assert.deepEqual(snapshot(dataDir), first);
+
+  assert.equal(run(t, { ...base, export: answer, now: NOW + RESIGN_AFTER }).issued_at, NOW + RESIGN_AFTER);
+  assert.equal(run(t, { ...base, export: { ...answer, state_sha256: "b".repeat(64) }, now: NOW + RESIGN_AFTER + 60 }).outcome, "signed");
+
+  // trust.json now names another key current: the kind is signed at once under it
+  const rotated = throwawayTrust({ suffixes: ["b", "c"] });
+  const again = run(t, { ...base, export: { ...answer, state_sha256: "b".repeat(64) }, trust: rotated.trust, secret: seedSecret(rotated.seeds.animsets.current), now: NOW + RESIGN_AFTER + 120 });
+  assert.equal(again.outcome, "signed");
+});
+
+test("what is on the data branch is read or the kind is not signed", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const dir = scratch(t);
+  const dataDir = path.join(dir, "data");
+  const base = { dir, dataDir, kind: "characters", trust, secret: seedSecret(seeds.characters.current) };
+  run(t, { ...base, export: exportOf("characters", { rows: golden("withdrawn/characters/valid.json").signed.rows }), now: NOW });
+  fs.writeFileSync(path.join(dataDir, documentPath("characters", "withdrawn")), "{");
+  // an unreadable earlier document is not "no earlier rows"
+  assert.throws(() => run(t, { ...base, export: exportOf("characters"), now: NOW + 60 }), refusal("E_PREVIOUS_UNREADABLE"));
+});
+
+test("trust.json is believed only under the roots, and only while it lasts", (t) => {
+  const mine = throwawayTrust();
+  const theirs = throwawayTrust();
+  const answer = exportOf("commands");
+  const go = (trustDoc, roots, now = NOW) => {
+    const dir = scratch(t);
+    const trustFile = path.join(dir, "trust.json");
+    fs.writeFileSync(trustFile, JSON.stringify(trustDoc));
+    return import("../lib/trust.mjs").then(({ loadTrust }) => loadTrust({ file: trustFile, now, roots }));
+  };
+  return Promise.all([
+    assert.rejects(go(mine.doc, theirs.roots), refusal("E_TRUST_UNVERIFIED")),
+    assert.rejects(go({ ...mine.doc, signed: { ...mine.doc.signed, serial: 2 } }, mine.roots), refusal("E_TRUST_UNVERIFIED")),
+    assert.rejects(go(mine.doc, mine.roots, NOW + 366 * 86400), refusal("E_TRUST_EXPIRED")),
+    go(mine.doc, mine.roots).then((trust) => {
+      assert.equal(trust.kindKeys("commands").current.key_id, "astra-commands-testa");
+      assert.throws(() => trust.kindKeys("games"), refusal("E_TRUST_KIND_KEYS"));
+      void answer;
+    }),
+  ]);
+});
+
+test("the specification's goldens are judged through the bridge as vectors.json records", () => {
+  // The bridge adds nothing to the checker; this holds it to that over every
+  // index and withdrawn golden, so a bridge that swallowed a refusal is red.
+  const { trust } = goldenTrust();
+  const vectors = JSON.parse(fs.readFileSync(path.join(GOLDENS, "vectors.json"), "utf8"));
+  let n = 0;
+  for (const doc of DOCS) {
+    for (const v of vectors[doc]) {
+      const got = checkDocument({ file: path.join(GOLDENS, v.file), kind: v.kind, doc, now: v.now ?? vectors.now, trust: trust.signed });
+      const label = `${doc}/${v.kind}/${v.name}`;
+      if (v.verdict === "accept") assert.equal(got.ok, true, label);
+      else if (v.check === "parse") assert.ok(got.parse, label);
+      else if (v.check === "schema") assert.ok(got.schema, label);
+      else if (v.check === "semantic") assert.deepEqual(got.rules, [v.rule], label);
+      else if (v.check === "signature") assert.ok(!got.schema && !got.rules.length && got.verified_by.length === 0 && got.reason === v.reason, label);
+      else assert.fail(`${label}: an unknown check ${v.check}`);
+      n++;
+    }
+  }
+  assert.ok(n >= 80, `${n} goldens`);
+});

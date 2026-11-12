@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Minice — https://minice.ai
+#
+# Keep the schedules running.
+#
+# GitHub disables every scheduled workflow of a public repository once the
+# repository has seen no activity for 60 days, and it does not enable them
+# again by itself. This repository's `main` can easily go 60 days without a
+# commit: the signer's own commits go to `data`, and whether a push to a
+# branch other than the default one counts as activity is not something
+# GitHub states. A disabled Sign workflow would mean that no kind is signed
+# again and every document expires seven days later.
+#
+# How this works: once a week this job calls the REST endpoint
+# `PUT /repos/{owner}/{repo}/actions/workflows/{file}/enable` for Sign and
+# for itself. Enabling a workflow that is already enabled changes nothing
+# visible, and it restarts that workflow's 60-day count. The call needs
+# `actions: write` on this repository and nothing else: the job's own token,
+# no secret, no environment, and no checkout. If a workflow was already
+# disabled when this runs (for example by hand), this enables it again, so
+# disable this workflow first to keep Sign off.
+
+name: Keepalive
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  enable:
+    name: Re-enable the scheduled workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Enable Sign and Keepalive
+        run: |
+          set -euo pipefail
+          for workflow in sign.yml keepalive.yml; do
+            gh api --method PUT "repos/$REPO/actions/workflows/$workflow/enable"
+            echo "$workflow: enabled"
+          done
