@@ -54,7 +54,7 @@ jobs:
         env:
           ASTRAPLUGINS_CHECKOUT: ${{ github.workspace }}/upstream/astraplugins
           ASTRA_REGISTRY_CHECKOUT: ${{ github.workspace }}/upstream/astra-registry
-        run: node --test test/
+        run: node --test "test/*.test.mjs"
 
       - name: The owner's scripts parse
         run: bash -n owner/create.sh && bash -n owner/secrets.sh

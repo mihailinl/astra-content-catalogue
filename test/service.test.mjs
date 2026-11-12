@@ -70,7 +70,7 @@ test("a door that is not open ends the run green, and is asked once", async (t) 
 });
 
 test("a refused call fails the run and still hands on the kinds that were answered", async (t) => {
-  const { impl } = fakeFetch((kind) => (kind === "models" ? json(401, { error: "token_refused" }) : json(200, exportOf(kind))));
+  const { impl } = fakeFetch((kind) => (kind === "models" ? json(429, { error: "rate_limited" }) : json(200, exportOf(kind))));
   const out = scratch(t);
   const outputs = path.join(out, "outputs");
   const lines = [];
@@ -79,13 +79,21 @@ test("a refused call fails the run and still hands on the kinds that were answer
   assert.equal(work.kinds.commands, "fetched");
   assert.equal(work.kinds.packs, "fetched");
   assert.equal(fs.readFileSync(outputs, "utf8"), "todo=true\nfailed=true\n");
-  assert.ok(lines.includes("models: refused (HTTP 401 token_refused)"));
+  assert.ok(lines.includes("models: refused (HTTP 429 rate_limited)"));
   assert.ok(!fs.existsSync(path.join(out, "export-models.json")));
   // the bytes handed on are the service's, untouched
   assert.equal(fs.readFileSync(path.join(out, "export-packs.json"), "utf8"), JSON.stringify(exportOf("packs")));
   // no token is ever written to the log or to the files
   const everything = lines.join("\n") + fs.readdirSync(out).map((f) => fs.readFileSync(path.join(out, f), "utf8")).join("\n");
   assert.ok(!/token-\d|request-token/.test(everything));
+});
+
+test("a refused token is not offered four more times", async () => {
+  const { impl, calls } = fakeFetch(() => json(401, { error: "token_refused" }));
+  const got = await fetchAll({ env: ENV, fetchImpl: impl });
+  assert.equal(calls.doors.length, 1);
+  assert.deepEqual(Object.values(got).map((r) => r.status), KINDS.map(() => "refused"));
+  assert.equal(got.packs.why, "not asked: HTTP 401 token_refused");
 });
 
 test("other answers are refusals, not a closed door", async () => {

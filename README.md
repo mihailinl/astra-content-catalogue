@@ -158,7 +158,7 @@ service pins. An optional repository variable `CONTENT_SERVICE_URL` points
 ## Working on it
 
 ```sh
-node --test test/        # Node >= 22 and python3 >= 3.11; no network, no dependencies
+npm test                 # Node >= 22 and python3 >= 3.11; no network, no dependencies
 node bin/vendor.mjs check --astraplugins <checkout> --astra-registry <checkout>
 node bin/vendor.mjs update --astraplugins <checkout> --astra-registry <checkout>
 ```
