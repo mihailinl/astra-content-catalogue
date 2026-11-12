@@ -11,10 +11,12 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { main as dataMain } from "../bin/data.mjs";
+import { main as prepareMain } from "../bin/prepare.mjs";
 import { main as signMain } from "../bin/sign.mjs";
+import { main as verifyMain } from "../bin/verify.mjs";
 import { documentPath, KINDS, statePath } from "../lib/kinds.mjs";
-import { openData, publishData } from "../lib/data.mjs";
-import { exportOf, golden, NOW, scratch, seedSecret, throwawayTrust, writeExport } from "./helpers.mjs";
+import { everHeld, openData, publishData } from "../lib/data.mjs";
+import { exportOf, golden, iso, NOW, scratch, seedSecret, throwawayTrust, writeExport } from "./helpers.mjs";
 
 const git = (dir, ...args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
 function bare(t) {
@@ -24,25 +26,40 @@ function bare(t) {
 }
 const filesAt = (remote, ref = "data") => git(remote, "ls-tree", "-r", "--name-only", ref).split("\n").filter(Boolean);
 
-/** One leg of sign.yml as its three steps run it, against `remote`. */
+/** One leg of sign.yml as its five steps run it, against `remote`. A step that exits 1 ends the leg, as in the workflow. */
 function leg(t, { remote, kind, answer, trust, secret, now, status = "fetched" }) {
   const dir = scratch(t, "leg");
   const exportsDir = path.join(dir, "exports");
   fs.mkdirSync(exportsDir);
   fs.writeFileSync(path.join(exportsDir, "work.json"), JSON.stringify({ kinds: { [kind]: status } }));
-  if (answer) writeExport(exportsDir, kind, answer);
+  if (answer) writeExport(exportsDir, kind, { ...answer, generated_at: iso(now) });
   const trustFile = path.join(dir, "trust.json");
   fs.writeFileSync(trustFile, JSON.stringify(trust.doc));
   const data = path.join(dir, "data");
-  const report = path.join(dir, "report.json");
+  const work = path.join(dir, "work");
   const log = [];
-  const say = (l) => log.push(l);
-  assert.equal(dataMain(["open", "--dir", data, "--remote", remote], { env: {}, log: say }), 0);
+  const o = { now, roots: trust.roots, log: (l) => log.push(l) };
   const env = { CONTENT_SIGNING_KEY: secret };
-  const signed = signMain(["--kind", kind, "--exports", exportsDir, "--data", data, "--trust", trustFile, "--report", report], { env, now, roots: trust.roots, log: say });
-  assert.equal("CONTENT_SIGNING_KEY" in env, false, "the key leaves the environment once read");
-  const exit = signed.outcome === "refused" ? null : dataMain(["publish", "--dir", data, "--report", report], { env: {}, log: say });
-  return { signed, exit, log, data };
+  const steps = [
+    ["open", () => dataMain(["open", "--dir", data, "--remote", remote], { env: {}, log: o.log })],
+    ["prepare", () => prepareMain(["--kind", kind, "--exports", exportsDir, "--data", data, "--trust", trustFile, "--work", work], { ...o, env: {} })],
+    ["sign", () => signMain(["--kind", kind, "--trust", trustFile, "--work", work], { ...o, env })],
+    ["verify", () => verifyMain(["--kind", kind, "--data", data, "--trust", trustFile, "--work", work], { ...o, env: {} })],
+    ["publish", () => dataMain(["publish", "--dir", data, "--work", work], { env: {}, log: o.log })],
+  ];
+  let exit = 0;
+  let failedAt = null;
+  for (const [name, step] of steps) {
+    exit = step();
+    if (exit !== 0) {
+      failedAt = name;
+      break;
+    }
+  }
+  assert.equal("CONTENT_SIGNING_KEY" in env, failedAt === "open" || failedAt === "prepare", "the key leaves the environment once the key step has read it");
+  const reportFile = path.join(work, "report.json");
+  const signed = fs.existsSync(reportFile) ? JSON.parse(fs.readFileSync(reportFile, "utf8")) : { outcome: "refused" };
+  return { signed, exit, failedAt, log, data };
 }
 
 test("the first signing starts data, and each later one moves it forward by one commit", (t) => {
@@ -98,6 +115,35 @@ test("a kept row is published first, and then the run fails", (t) => {
   assert.equal(still.exit, 1);
 });
 
+test("a kind whose files were removed from data is not signed as if it were new", (t) => {
+  const remote = bare(t);
+  const trust = throwawayTrust();
+  const row = golden("withdrawn/commands/seq-1-security.json").signed.rows[0];
+  const secret = seedSecret(trust.seeds.commands.current);
+  assert.equal(leg(t, { remote, kind: "commands", answer: exportOf("commands", { rows: [row] }), trust, secret, now: NOW }).exit, 0);
+  assert.equal(leg(t, { remote, kind: "packs", answer: exportOf("packs"), trust, secret: seedSecret(trust.seeds.packs.current), now: NOW + 1 }).exit, 0);
+
+  // a commit on data that deletes the kind's three files (by whoever could write the branch)
+  const clone = scratch(t, "clone");
+  openData({ remote, dir: clone });
+  assert.equal(everHeld({ dir: clone, kind: "commands" }), true);
+  assert.equal(everHeld({ dir: clone, kind: "models" }), false, "a kind no commit ever touched");
+  fs.rmSync(path.join(clone, "registry", "v1", "commands"), { recursive: true });
+  fs.rmSync(path.join(clone, "state", "commands.json"));
+  git(clone, "add", "-A");
+  git(clone, "-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "remove commands");
+  git(clone, "push", "-q", "origin", "HEAD:refs/heads/data");
+  const head = git(remote, "rev-parse", "data");
+
+  // the answer omits the row: signed as a first signing, the row would be gone
+  const r = leg(t, { remote, kind: "commands", answer: exportOf("commands", { rows: [] }), trust, secret, now: NOW + 600 });
+  assert.deepEqual({ exit: r.exit, failedAt: r.failedAt }, { exit: 1, failedAt: "prepare" });
+  assert.deepEqual(r.log.slice(-1), ["commands: not signed (E_PREVIOUS_MISSING); the last signed documents stay"]);
+  assert.equal(git(remote, "rev-parse", "data"), head, "and nothing is published");
+  // a kind the branch never held is still signed for the first time on that same branch
+  assert.equal(leg(t, { remote, kind: "models", answer: exportOf("models"), trust, secret: seedSecret(trust.seeds.models.current), now: NOW + 700 }).exit, 0);
+});
+
 test("data never moves back: a push over a remote that moved is refused", (t) => {
   const remote = bare(t);
   const dirs = [scratch(t, "a"), scratch(t, "b")];
@@ -110,6 +156,13 @@ test("data never moves back: a push over a remote that moved is refused", (t) =>
   const head = git(remote, "rev-parse", "data");
   // the second checkout was opened before the first pushed; its commit is not a descendant
   assert.throws(() => publishData({ dir: dirs[1], message: "second" }));
+  // as a command it is exit 1 and one line of git's own words, with nothing a log could take for a command
+  fs.mkdirSync(path.join(dirs[1], "w"));
+  fs.writeFileSync(path.join(dirs[1], "w", "report.json"), JSON.stringify({ kind: "commands", outcome: "signed", issued_at: 1, key_id: "k", carried: 0 }));
+  fs.writeFileSync(path.join(dirs[1], "state", "commands.json"), '{"n":9}\n');
+  const said = [];
+  assert.equal(dataMain(["publish", "--dir", dirs[1], "--work", path.join(dirs[1], "w")], { env: {}, log: (l) => said.push(l) }), 1);
+  assert.match(said[0], /^data: git failed \([A-Za-z0-9 _.\/()'!>-]*\)$/);
   assert.equal(git(remote, "rev-parse", "data"), head);
 
   // opened again from the new tip, the same change goes through as a descendant
@@ -132,7 +185,8 @@ test("a leg with no export: a closed door is quiet, anything else fails", (t) =>
   assert.equal(closed.signed.outcome, "closed");
   assert.equal(closed.exit, 0);
   const refused = leg(t, { remote, kind: "models", answer: null, trust, secret, now: NOW, status: "refused" });
-  assert.deepEqual({ outcome: refused.signed.outcome, code: refused.signed.code }, { outcome: "refused", code: "E_EXPORT_ABSENT" });
+  assert.deepEqual({ exit: refused.exit, failedAt: refused.failedAt }, { exit: 1, failedAt: "prepare" });
+  assert.deepEqual(refused.log.slice(-1), ["models: not signed (E_EXPORT_ABSENT); the last signed documents stay"]);
   assert.equal(git(remote, "for-each-ref", "refs/heads/data"), "", "and data is not started for nothing");
 });
 

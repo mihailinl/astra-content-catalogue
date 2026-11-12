@@ -2,20 +2,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Minice — https://minice.ai
 //
-// sign.yml, job `sign`, the two steps around the signing step. Neither holds
-// the key; both hold the job's token (GITHUB_TOKEN, `contents: write`).
+// The `data` branch, opened and moved forward. Both commands hold the job's
+// token (GITHUB_TOKEN) and neither holds a key.
 //
 //   node bin/data.mjs open    --dir <dir> [--remote <url>]
-//       check out the `data` branch into <dir>, or start it
-//   node bin/data.mjs publish --dir <dir> --report <file>
-//       commit what the signing step wrote and move `data` forward, then exit
-//       1 if the signed withdrawn document keeps a row that the service's
-//       answer omitted. Publishing comes first on purpose: the kept row must
-//       reach clients, and the failed run is how a person learns of it.
+//       check out the `data` branch into <dir>, or start it. Used by the
+//       `work` job (to see when each kind was last signed) and as the first
+//       step of a signing leg.
+//   node bin/data.mjs publish --dir <dir> --work <dir>
+//       the last step of a signing leg: commit what bin/verify.mjs installed
+//       and move `data` forward, then exit 1 if the signed withdrawn document
+//       keeps a row that the service's answer omitted. Publishing comes first
+//       on purpose: the kept row must reach clients, and the failed run is
+//       how a person learns of it.
 
 import fs from "node:fs";
+import path from "node:path";
 
-import { parseArgs } from "../lib/args.mjs";
+import { isMain, parseArgs, runAsCommand } from "../lib/args.mjs";
 import { openData, publishData } from "../lib/data.mjs";
 
 function remoteOf(args, env) {
@@ -24,7 +28,20 @@ function remoteOf(args, env) {
   return `${env.GITHUB_SERVER_URL || "https://github.com"}/${env.GITHUB_REPOSITORY}.git`;
 }
 
-export function main(argv, { env = process.env, log = console.log } = {}) {
+/** The first line of git's own complaint, without anything a log could take for a command. */
+const gitSaid = (e) => String(e?.stderr ?? "").split("\n")[0].replace(/[^A-Za-z0-9 _./()'!>-]/g, "").slice(0, 200);
+
+export function main(argv, o = {}) {
+  try {
+    return run(argv, o);
+  } catch (e) {
+    if (e?.stderr === undefined) throw e;
+    (o.log ?? console.log)(`data: git failed (${gitSaid(e)})`);
+    return 1;
+  }
+}
+
+function run(argv, { env = process.env, log = console.log } = {}) {
   const [mode, ...rest] = argv;
   const token = env.GITHUB_TOKEN || null;
   if (mode === "open") {
@@ -34,8 +51,8 @@ export function main(argv, { env = process.env, log = console.log } = {}) {
     return 0;
   }
   if (mode === "publish") {
-    const args = parseArgs(rest, ["dir", "report"]);
-    const report = JSON.parse(fs.readFileSync(args.report, "utf8"));
+    const args = parseArgs(rest, ["dir", "work"]);
+    const report = JSON.parse(fs.readFileSync(path.join(args.work, "report.json"), "utf8"));
     if (report.outcome === "signed") {
       const r = publishData({ dir: args.dir, message: `sign ${report.kind}: issued_at ${report.issued_at} under ${report.key_id}`, token });
       log(r.pushed ? `data moved forward to ${r.head}` : "nothing to publish");
@@ -51,15 +68,7 @@ export function main(argv, { env = process.env, log = console.log } = {}) {
     }
     return 0;
   }
-  throw new Error("usage: node bin/data.mjs open|publish --dir <dir> [--report <file>] [--remote <url>]");
+  throw new Error("usage: node bin/data.mjs open|publish --dir <dir> [--work <dir>] [--remote <url>]");
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  try {
-    process.exit(main(process.argv.slice(2)));
-  } catch (e) {
-    // git's stderr may quote a URL; the token is never part of one (lib/data.mjs)
-    console.error(String(e?.stderr || e?.message || e).slice(0, 2000));
-    process.exit(1);
-  }
-}
+if (isMain(import.meta)) runAsCommand(main);

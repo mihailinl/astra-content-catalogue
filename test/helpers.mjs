@@ -12,7 +12,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { privateKeyFromSeed, publicKeyBase64, publicKeyFromBase64, signEnvelope, TRUST_SCHEMA } from "../vendor/astra-registry/bot/lib/sign.mjs";
-import { KINDS } from "../lib/kinds.mjs";
+import { documentPath, domainOf, KINDS, statePath } from "../lib/kinds.mjs";
+import { documentBytes, prepareKind, signPrepared, verifyAndInstall } from "../lib/pipeline.mjs";
+import { DOCS } from "../lib/kinds.mjs";
 import { loadTrust } from "../lib/trust.mjs";
 import { ROOT } from "../lib/vendored.mjs";
 
@@ -46,7 +48,6 @@ export function throwawayTrust({ now = NOW, kinds = KINDS, mutate = null, suffix
   const root = privateKeyFromSeed(rootSeed);
   const seeds = {};
   const kind_keys = [];
-  const iso = (s) => `${new Date(s * 1000).toISOString().slice(0, 19)}Z`;
   for (const kind of kinds) {
     seeds[kind] = { current: crypto.randomBytes(32), next: crypto.randomBytes(32) };
     for (const [role, suffix, nb] of [["current", suffixes[0], now - 30 * 86400], ["next", suffixes[1], now - 29 * 86400]]) {
@@ -67,13 +68,15 @@ export function throwawayTrust({ now = NOW, kinds = KINDS, mutate = null, suffix
   return { doc, roots, seeds, trust: loadTrust({ doc, now, roots }), rootSeed };
 }
 
-/** An `astra.content.export/1` answer. */
-export function exportOf(kind, { entries = [], rows = [], lifts = [], state = null } = {}) {
+export const iso = (s) => `${new Date(s * 1000).toISOString().slice(0, 19)}Z`;
+
+/** An `astra.content.export/1` answer, generated at the second `at`. */
+export function exportOf(kind, { entries = [], rows = [], lifts = [], state = null, at = NOW } = {}) {
   const body = { entries, withdrawn: { rows, lifts } };
   return {
     schema: "astra.content.export/1",
     kind,
-    generated_at: "2026-12-31T00:00:00Z",
+    generated_at: iso(at),
     state_sha256: state ?? crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex"),
     ...body,
   };
@@ -93,10 +96,45 @@ export function snapshot(dir) {
     for (const d of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
       if (d.name === ".git") continue;
       const p = path.join(rel, d.name);
-      if (d.isDirectory()) walk(p);
+      if (d.isSymbolicLink()) out[p] = "(link)";
+      else if (d.isDirectory()) walk(p);
       else out[p] = fs.readFileSync(path.join(dir, p)).toString("base64");
     }
   };
   if (fs.existsSync(dir)) walk("");
   return out;
+}
+
+/** Whether a data directory holds any file of the kind: what `everHeld` is for a directory with no history. */
+export const holds = (dataDir, kind) => [...DOCS.map((d) => documentPath(kind, d)), statePath(kind)].some((f) => fs.existsSync(path.join(dataDir, f)));
+
+/**
+ * The three stages of one leg, one after another, as the workflow's three
+ * middle steps run them (lib/pipeline.mjs). Returns the report of the last.
+ */
+export function signKind({ kind, exportFile, dataDir, trust, secret, now, tmpDir, everHeld = holds(dataDir, kind), verify, check }) {
+  const workDir = fs.mkdtempSync(path.join(tmpDir, "work-"));
+  try {
+    prepareKind({ kind, exportFile, dataDir, trust, now, workDir, everHeld });
+    signPrepared({ kind, workDir, trust, secret });
+    return verifyAndInstall({ kind, workDir, dataDir, trust, ...(verify ? { verify } : {}), ...(check ? { check } : {}) });
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+/** Write a kind's pair and state into a data directory, signed by `seed` under `keyId`, as the signer would have. */
+export function plant(dataDir, kind, { seed, keyId, serial, entries = [], rows = [], lifts = [], stateSha256 = "0".repeat(64), carried = 0, serials = {} }) {
+  const signer = { key_id: keyId, privateKey: privateKeyFromSeed(seed) };
+  for (const doc of DOCS) {
+    const at = serials[doc] ?? serial;
+    const head = { schema: domainOf(kind, doc), serial: at, issued_at: at, expires_at: at + 7 * 86400 };
+    const signed = doc === "index" ? { ...head, entries } : { ...head, rows, lifts };
+    const file = path.join(dataDir, documentPath(kind, doc));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, documentBytes(signEnvelope({ domain: domainOf(kind, doc), signed, signers: [signer] })));
+  }
+  const stateFile = path.join(dataDir, statePath(kind));
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, JSON.stringify({ schema: "astra.content.signer-state/1", kind, state_sha256: stateSha256, issued_at: serial, key_id: keyId, carried }));
 }

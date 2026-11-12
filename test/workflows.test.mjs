@@ -31,7 +31,10 @@ test("one_job_reads_one_kinds_key", () => {
   assert.equal(work.environment, SERVICE_ENVIRONMENT);
   assert.deepEqual(work.permissions, { contents: "read", "id-token": "write" });
   assert.ok(!READS_SECRET.test(spelled(work)) && !/\bsecrets\b/.test(spelled(work)), "work names no secret");
-  assert.ok(!spelled(work).includes("github.token"), "work does not use the repository token either");
+  // its one use of the repository token is to read `data`, with a token that can only read
+  assert.deepEqual(work.steps.filter((s) => s.env?.GITHUB_TOKEN).map((s) => s.run), ['node bin/data.mjs open --dir "$RUNNER_TEMP/data"']);
+  assert.equal(work.env, undefined, "and no variable can point it at another service");
+  assert.ok(!/\bvars\./.test(spelled(wf)), "no repository variable is read anywhere in sign.yml");
 
   // sign: one leg per kind, each naming its own environment and its own secret
   const legs = sign.strategy.matrix.include;
@@ -46,13 +49,17 @@ test("one_job_reads_one_kinds_key", () => {
   assert.deepEqual(sign.permissions, { contents: "write" }, "a signing leg can push data and cannot mint an OIDC token");
   assert.ok(!spelled(sign).includes("id-token"));
 
-  // the key is read in one step of the leg, by the leg's own secret name, and nowhere else in the file
+  // the key is in the environment of exactly one step of the leg, by the leg's own secret name
   const naming = sign.steps.filter((s) => READS_SECRET.test(spelled(s)));
   assert.equal(naming.length, 1, "one step sees the key");
-  assert.deepEqual(naming[0].env, { CONTENT_SIGNING_KEY: "${{ secrets[matrix.secret] }}" });
-  assert.match(naming[0].run, /^node bin\/sign\.mjs /);
-  assert.ok(!naming[0].env.GITHUB_TOKEN && !/github\.token/.test(spelled(naming[0])), "the step with the key has no token");
+  assert.deepEqual(naming[0].env, { CONTENT_SIGNING_KEY: "${{ secrets[matrix.secret] }}" }, "and it sees nothing else: no token");
+  assert.equal(sign.steps.filter((s) => s.env && "CONTENT_SIGNING_KEY" in s.env).length, 1);
   assert.equal(sign.env?.CONTENT_SIGNING_KEY, undefined, "the key is not in the job's environment");
+  // that step runs one Node file and nothing else: no second command, no pipe, no substitution, no action
+  assert.equal(naming[0].uses, undefined);
+  assert.match(naming[0].run, /^node bin\/sign\.mjs( --[a-z]+ ("\$[A-Z_]+(\/[a-z]+)?"|[A-Za-z0-9_.\/-]+))+$/);
+  assert.equal(naming[0].run, 'node bin/sign.mjs --kind "$KIND" --trust registry-trust/registry/v1/trust.json --work "$RUNNER_TEMP/work"');
+  assert.equal(naming[0].shell, undefined);
   const uncommented = text("sign.yml").split("\n").filter((l) => !l.trim().startsWith("#")).join("\n");
   assert.equal(uncommented.match(/secrets\b/g).length, 1, "`secrets` is written once in sign.yml");
   assert.ok(!/secrets:\s*inherit/.test(uncommented));
@@ -60,10 +67,17 @@ test("one_job_reads_one_kinds_key", () => {
     assert.equal(uncommented.split(secretOf(kind)).length - 1, 1, `${secretOf(kind)} is named by one leg`);
     assert.equal(uncommented.split(environmentOf(kind)).length - 1, 1, `${environmentOf(kind)} is named by one leg`);
   }
-  // the steps with the token are the two around it, and they run this repository's code only
-  const withToken = sign.steps.filter((s) => s.env?.GITHUB_TOKEN);
-  assert.deepEqual(withToken.map((s) => s.run.split(" ").slice(0, 3).join(" ")), ["node bin/data.mjs open", "node bin/data.mjs publish"]);
-  assert.ok(sign.steps.indexOf(withToken[0]) < sign.steps.indexOf(naming[0]) && sign.steps.indexOf(naming[0]) < sign.steps.indexOf(withToken[1]));
+  // the five steps of a leg, in order: the token only at the two ends, the key only in the middle,
+  // and the two steps that run the checker on either side of the key with neither
+  const commands = sign.steps.filter((s) => s.run).map((s) => ({ run: s.run.split(" ").slice(0, 3).join(" ").replace(/ --\w+$/, ""), env: Object.keys(s.env ?? {}) }));
+  assert.deepEqual(commands, [
+    { run: "node bin/data.mjs open", env: ["GITHUB_TOKEN"] },
+    { run: "node bin/prepare.mjs", env: [] },
+    { run: "node bin/sign.mjs", env: ["CONTENT_SIGNING_KEY"] },
+    { run: "node bin/verify.mjs", env: [] },
+    { run: "node bin/data.mjs publish", env: ["GITHUB_TOKEN"] },
+  ]);
+  assert.deepEqual(sign.env, { KIND: "${{ matrix.kind }}" });
 
   // no other workflow names a signing environment, a secret, or an OIDC token
   for (const name of fs.readdirSync(DIR).filter((n) => n !== "sign.yml")) {

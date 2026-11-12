@@ -13,9 +13,9 @@ import { test } from "node:test";
 import { jcs } from "../vendor/astra-registry/tools/lib/canonical.mjs";
 import { carryRows, lifts } from "../lib/carry.mjs";
 import { checkDocument } from "../lib/checker.mjs";
-import { DOCS, documentPath, KINDS, MAX_DOCUMENT_BYTES, Refused, RESIGN_AFTER, statePath } from "../lib/kinds.mjs";
-import { signKind } from "../lib/pipeline.mjs";
-import { exportOf, golden, GOLDENS, goldenTrust, NOW, scratch, seedSecret, snapshot, testSeed, throwawayTrust, writeExport } from "./helpers.mjs";
+import { prepareKind } from "../lib/pipeline.mjs";
+import { DOCS, documentPath, EXPORT_MAX_AGE, EXPORT_MAX_AHEAD, KINDS, MAX_DOCUMENT_BYTES, MAX_EXPORT_BYTES, Refused, RESIGN_AFTER, statePath } from "../lib/kinds.mjs";
+import { exportOf, golden, GOLDENS, goldenTrust, iso, NOW, plant, scratch, seedSecret, signKind, snapshot, testSeed, throwawayTrust, writeExport } from "./helpers.mjs";
 
 const read = (dir, kind, doc) => JSON.parse(fs.readFileSync(path.join(dir, documentPath(kind, doc)), "utf8"));
 const refusal = (code) => (e) => e instanceof Refused && e.code === code;
@@ -25,8 +25,11 @@ function run(t, o) {
   const dir = o.dir ?? scratch(t);
   const dataDir = o.dataDir ?? path.join(dir, "data");
   fs.mkdirSync(dataDir, { recursive: true });
-  const exportFile = writeExport(dir, o.kind, o.export, { raw: o.raw ?? null });
-  return signKind({ kind: o.kind, exportFile, dataDir, trust: o.trust, secret: o.secret, now: o.now ?? NOW, tmpDir: dir });
+  const now = o.now ?? NOW;
+  // an answer is generated when it is asked for, unless the test is about its age
+  const answer = o.export && !o.keepTime ? { ...o.export, generated_at: iso(now) } : o.export;
+  const exportFile = writeExport(dir, o.kind, answer, { raw: o.raw ?? null });
+  return signKind({ kind: o.kind, exportFile, dataDir, trust: o.trust, secret: o.secret, now, tmpDir: dir, ...("everHeld" in o ? { everHeld: o.everHeld } : {}), verify: o.verify, check: o.check });
 }
 
 test("a golden round trip: the signer reproduces every valid golden, and the vendored verifier accepts it", (t) => {
@@ -152,9 +155,19 @@ test("serial_never_goes_back", (t) => {
     assert.throws(() => run(t, { ...base, export: changed, now }), refusal("E_SERIAL_BACK"), `a clock at ${now - NOW}s`);
     assert.deepEqual(snapshot(dataDir), before, "and the last pair is untouched");
   }
-  // the floor is each document's own serial, not only the state file's word for it
-  fs.rmSync(path.join(dataDir, statePath("models")));
-  assert.throws(() => run(t, { ...base, export: changed, now: NOW }), refusal("E_SERIAL_BACK"));
+  // the floor is the serial the verified documents carry, never the state file's word for it:
+  // a state file that names an earlier second is a mismatch, not a lower floor
+  const stateFile = path.join(dataDir, statePath("models"));
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  fs.writeFileSync(stateFile, JSON.stringify({ ...state, issued_at: NOW - 1000 }));
+  assert.throws(() => run(t, { ...base, export: changed, now: NOW - 500 }), refusal("E_STATE_MISMATCH"));
+  fs.writeFileSync(stateFile, JSON.stringify(state));
+  // and each document's serial counts by itself: a pair whose two serials differ is no pair
+  for (const doc of DOCS) {
+    const d2 = scratch(t);
+    plant(path.join(d2, "data"), "models", { seed: seeds.models.current, keyId: "astra-models-testa", serial: NOW, serials: { [doc]: NOW + 50 } });
+    assert.throws(() => run(t, { ...base, dir: d2, dataDir: path.join(d2, "data"), export: changed, now: NOW + 10 }), refusal("E_PREVIOUS_PAIR"), doc);
+  }
 
   const next = run(t, { ...base, export: changed, now: NOW + 1 });
   assert.equal(next.issued_at, NOW + 1);
@@ -329,7 +342,7 @@ test("a document the specification's checker refuses is not signed", (t) => {
     const dir = scratch(t);
     assert.throws(
       () => run(t, { ...base, dir, export: answer }),
-      (e) => e instanceof Refused && e.code === "E_DOCUMENT_REFUSED" && e.message.includes(rule),
+      (e) => e instanceof Refused && e.code === "E_DOCUMENT_REFUSED" && e.line() === `E_DOCUMENT_REFUSED at ${rule === "unique-id-version" ? "index" : "withdrawn"}/rule/${rule}`,
       rule,
     );
     assert.deepEqual(snapshot(path.join(dir, "data")), {});
@@ -352,21 +365,113 @@ test("an unchanged kind is signed again only after six hours, or under another k
   assert.equal(run(t, { ...base, export: answer, now: NOW + RESIGN_AFTER }).issued_at, NOW + RESIGN_AFTER);
   assert.equal(run(t, { ...base, export: { ...answer, state_sha256: "b".repeat(64) }, now: NOW + RESIGN_AFTER + 60 }).outcome, "signed");
 
-  // trust.json now names another key current: the kind is signed at once under it
-  const rotated = throwawayTrust({ suffixes: ["b", "c"] });
-  const again = run(t, { ...base, export: { ...answer, state_sha256: "b".repeat(64) }, trust: rotated.trust, secret: seedSecret(rotated.seeds.animsets.current), now: NOW + RESIGN_AFTER + 120 });
-  assert.equal(again.outcome, "signed");
+  // a trust.json that holds neither key the pair was signed with proves nothing about the pair:
+  // the kind is not signed over it (README, "When both keys of a kind are replaced")
+  const unrelated = throwawayTrust({ suffixes: ["c", "d"] });
+  assert.throws(
+    () => run(t, { ...base, export: answer, trust: unrelated.trust, secret: seedSecret(unrelated.seeds.animsets.current), now: NOW + RESIGN_AFTER + 120 }),
+    refusal("E_PREVIOUS_UNVERIFIED"),
+  );
 });
 
-test("what is on the data branch is read or the kind is not signed", (t) => {
+test("what is on the data branch is proven before anything is built on it", (t) => {
   const { trust, seeds } = throwawayTrust();
+  const rows = golden("withdrawn/characters/valid.json").signed.rows;
+  const secret = seedSecret(seeds.characters.current);
+  /** A data directory holding characters signed at NOW with one withdrawn row, then damaged. */
+  const damaged = (name, damage, code, o = {}) => {
+    const dir = scratch(t);
+    const dataDir = path.join(dir, "data");
+    const base = { dir, dataDir, kind: "characters", trust, secret };
+    run(t, { ...base, export: exportOf("characters", { rows }), now: NOW });
+    damage(dataDir);
+    const before = snapshot(dataDir);
+    assert.throws(() => run(t, { ...base, export: exportOf("characters"), now: NOW + 60, ...o }), refusal(code), name);
+    if (!o.skipSnapshot) assert.deepEqual(snapshot(dataDir), before, `${name}: nothing is written`);
+  };
+  const withdrawn = (d) => path.join(d, documentPath("characters", "withdrawn"));
+  const index = (d) => path.join(d, documentPath("characters", "index"));
+  const state = (d) => path.join(d, statePath("characters"));
+  const edit = (file, f) => fs.writeFileSync(file, JSON.stringify(f(JSON.parse(fs.readFileSync(file, "utf8")))));
+
+  // an earlier document that is unreadable, or was changed after it was signed, is not "no earlier rows"
+  damaged("not JSON", (d) => fs.writeFileSync(withdrawn(d), "{"), "E_PREVIOUS_UNVERIFIED");
+  damaged("the rows removed after signing", (d) => edit(withdrawn(d), (e) => ({ ...e, signed: { ...e.signed, rows: [] } })), "E_PREVIOUS_UNVERIFIED");
+  damaged("the serial lowered after signing", (d) => edit(index(d), (e) => ({ ...e, signed: { ...e.signed, serial: 1, issued_at: 1 } })), "E_PREVIOUS_UNVERIFIED");
+  // a pair signed by a key that is not this kind's: another kind's current key, and a key nobody trusts
+  damaged("signed by another kind's key", (d) => plant(d, "characters", { seed: seeds.models.current, keyId: "astra-characters-testa", serial: NOW }), "E_PREVIOUS_UNVERIFIED");
+  damaged("signed by an unknown key", (d) => plant(d, "characters", { seed: crypto.randomBytes(32), keyId: "astra-characters-testa", serial: NOW }), "E_PREVIOUS_UNVERIFIED");
+  // the withdrawn document offered where the index belongs: the right key over the wrong domain
+  damaged("the withdrawn document as the index", (d) => fs.copyFileSync(withdrawn(d), index(d)), "E_PREVIOUS_UNVERIFIED");
+
+  // a pair that was there and is gone is not a first signing
+  const gone = (d) => [withdrawn(d), index(d), state(d)].forEach((f) => fs.rmSync(f));
+  damaged("all three files deleted", gone, "E_PREVIOUS_MISSING", { everHeld: true });
+  damaged("the withdrawn document deleted", (d) => fs.rmSync(withdrawn(d)), "E_PREVIOUS_MISSING");
+  damaged("the state file deleted", (d) => fs.rmSync(state(d)), "E_PREVIOUS_MISSING");
+
+  // the state file is a cache of what the documents prove
+  damaged("the state names another key", (d) => edit(state(d), (s) => ({ ...s, key_id: "astra-characters-testb" })), "E_STATE_MISMATCH");
+  damaged("the state names another second", (d) => edit(state(d), (s) => ({ ...s, issued_at: NOW + 1 })), "E_STATE_MISMATCH");
+  damaged("the state is for another kind", (d) => edit(state(d), (s) => ({ ...s, kind: "models" })), "E_STATE_MISMATCH");
+
+  // no symbolic link anywhere under registry/ or state/
+  const outside = scratch(t, "outside");
+  fs.writeFileSync(path.join(outside, "x.json"), "{}");
+  damaged("a linked document", (d) => {
+      fs.renameSync(withdrawn(d), path.join(outside, "w.json"));
+      fs.symlinkSync(path.join(outside, "w.json"), withdrawn(d));
+    }, "E_DATA_SYMLINK", { skipSnapshot: true });
+  damaged("a linked directory of another kind", (d) => fs.symlinkSync(outside, path.join(d, "registry", "v1", "packs")), "E_DATA_SYMLINK", { skipSnapshot: true });
+  damaged("a linked state directory", (d) => {
+      fs.renameSync(path.join(d, "state"), path.join(outside, "state"));
+      fs.symlinkSync(path.join(outside, "state"), path.join(d, "state"));
+    }, "E_DATA_SYMLINK", { skipSnapshot: true });
+
+  // the preparing step itself refuses a link, before it reads through one
+  const linked = scratch(t);
+  const linkedData = path.join(linked, "data");
+  run(t, { dir: linked, dataDir: linkedData, kind: "characters", trust, secret, export: exportOf("characters", { rows }), now: NOW });
+  fs.renameSync(withdrawn(linkedData), path.join(outside, "w2.json"));
+  fs.symlinkSync(path.join(outside, "w2.json"), withdrawn(linkedData));
+  assert.throws(
+    () => prepareKind({ kind: "characters", exportFile: writeExport(linked, "characters", exportOf("characters", { at: NOW + 60 })), dataDir: linkedData, trust, now: NOW + 60, workDir: path.join(linked, "w"), everHeld: true }),
+    refusal("E_DATA_SYMLINK"),
+  );
+  assert.ok(!fs.existsSync(path.join(linked, "w", "order.json")), "and leaves no order for the key step");
+
+  // a kind the branch never held is signed for the first time; the same empty directory under a
+  // branch that did hold it is refused (the first case above); and the row carried comes from the verified document
+  const dir = scratch(t);
+  const base = { dir, dataDir: path.join(dir, "data"), kind: "characters", trust, secret };
+  assert.equal(run(t, { ...base, export: exportOf("characters", { rows }), now: NOW, everHeld: false }).outcome, "signed");
+  assert.equal(run(t, { ...base, export: exportOf("characters"), now: NOW + 60 }).carried, rows.length);
+});
+
+test("an answer is signed only while it is fresh", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const base = { kind: "commands", trust, secret: seedSecret(seeds.commands.current), keepTime: true };
+  const at = (seconds) => exportOf("commands", { at: NOW + seconds });
+  for (const [age, ok] of [[0, true], [-EXPORT_MAX_AGE, true], [-EXPORT_MAX_AGE - 1, false], [-86400, false], [EXPORT_MAX_AHEAD, true], [EXPORT_MAX_AHEAD + 1, false]]) {
+    const dir = scratch(t);
+    if (ok) assert.equal(run(t, { ...base, dir, export: at(age) }).outcome, "signed", `${age} s`);
+    else {
+      assert.throws(() => run(t, { ...base, dir, export: at(age) }), refusal("E_EXPORT_STALE"), `${age} s`);
+      assert.deepEqual(snapshot(path.join(dir, "data")), {});
+    }
+  }
+  // the case this exists for: yesterday's run is run again, with yesterday's answer still in its artifact
   const dir = scratch(t);
   const dataDir = path.join(dir, "data");
-  const base = { dir, dataDir, kind: "characters", trust, secret: seedSecret(seeds.characters.current) };
-  run(t, { ...base, export: exportOf("characters", { rows: golden("withdrawn/characters/valid.json").signed.rows }), now: NOW });
-  fs.writeFileSync(path.join(dataDir, documentPath("characters", "withdrawn")), "{");
-  // an unreadable earlier document is not "no earlier rows"
-  assert.throws(() => run(t, { ...base, export: exportOf("characters"), now: NOW + 60 }), refusal("E_PREVIOUS_UNREADABLE"));
+  const row = seq("seq-1-security").rows[0];
+  run(t, { ...base, dir, dataDir, export: exportOf("commands", { rows: [], at: NOW }), now: NOW });
+  run(t, { ...base, dir, dataDir, export: exportOf("commands", { rows: [row], at: NOW + 3600 }), now: NOW + 3600 });
+  const before = snapshot(dataDir);
+  assert.throws(() => run(t, { ...base, dir, dataDir, export: exportOf("commands", { rows: [], at: NOW }), now: NOW + 86400 }), refusal("E_EXPORT_STALE"));
+  assert.deepEqual(snapshot(dataDir), before);
+  // an answer too large to be two documents is not read at all
+  const big = scratch(t);
+  assert.throws(() => run(t, { ...base, dir: big, raw: Buffer.alloc(MAX_EXPORT_BYTES + 1, 0x20) }), refusal("E_EXPORT_SIZE"));
 });
 
 test("trust.json is believed only under the roots, and only while it lasts", (t) => {
