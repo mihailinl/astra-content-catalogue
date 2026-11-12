@@ -27,24 +27,30 @@ contract, §4.7 (BOT-110, BOT-111, TRUST-50, SERVE-116).
    audience `https://api.minice.ai/plugins/v1/content`, one token per call.
    It runs in the environment `content-service` and holds **no secret**. The
    service address is a constant in the code: no variable can send the token
-   elsewhere.
-2. **`sign`** runs one leg per kind, one after another, each in that kind's
-   own environment `publish-<kind>`. A leg holds that kind's key and **no
-   OIDC token**, and is five steps:
+   elsewhere. Each answer is written to a scratch file, held to the export
+   schema, to freshness and to the kind's document schemas and rules, and
+   only then copied where the job's artifact is taken from; an answer that
+   fails never becomes an artifact.
+2. Then each kind goes through three jobs, each on a fresh runner of its
+   own. What passes from one job to the next is an artifact of fixed file
+   names, admitted file by file (name, regular file, size bound) before
+   anything in it is read, and nothing else: no job output, no variable, no
+   file on a shared disk.
 
-   | step | holds | does |
+   | job | holds | does |
    |---|---|---|
-   | open | the job's token | checks out `data` |
-   | prepare | nothing | reads the answer and the kind's last signed pair, checks, writes the two unsigned bodies |
-   | sign | **the key** | one Node file that starts no process and opens no connection; signs the two prepared bodies |
-   | verify | nothing | proves what was signed, then puts the three files in place |
-   | publish | the job's token | one commit on `data`, pushed forward |
+   | `prepare` | a token that can only read | reads the answer and the kind's last signed pair on `data`, runs the specification's checker, uploads `prepared-<kind>`: the two **unsigned** bodies, an order and the `trust.json` it used |
+   | `sign` | **the kind's key**, and a token with no permission at all | a fresh checkout of the same commit, a download of `prepared-<kind>`, **one** Node command (`bin/sign.mjs`) that starts no process and opens no connection, an upload of `signed-<kind>`: the two signed documents |
+   | `publish` | a token that can write contents, and no key | proves what was signed is what was prepared and verifies, then one commit on `data`, pushed forward; one kind at a time |
 
    The code that parses bytes the service chose, and the specification's
-   checker, run in *prepare* and *verify*, never in the step that has the
-   key.
+   checker, run in `prepare` and `publish`, never in the job that has the
+   key. The key job is in the kind's environment `publish-<kind>`; it can
+   neither write this repository nor mint an OIDC token
+   (`permissions: {}`), and it runs no setup action, no Python and no git of
+   its own.
 
-   *prepare* refuses the kind unless all of this holds:
+   `prepare` refuses the kind unless all of this holds:
    - the answer is strictly readable JSON with exactly the members of the
      export schema, and `generated_at` is within the last 30 minutes (so a
      re-run of an old run, or an old answer offered again, is not signed
@@ -62,23 +68,25 @@ contract, §4.7 (BOT-110, BOT-111, TRUST-50, SERVE-116).
    - both documents pass the specification's own checker (schema, semantic
      rules, pairing rules) and neither exceeds 1,048,576 bytes.
 
-   *sign* signs both with the kind's key (see Keys), under the domains
+   `sign` signs both with the kind's key (see Keys), under the domains
    `astra.<kind>.index/1` and `astra.<kind>.withdrawn/1`, and only bodies
-   that are canonical JSON for that kind and that second.
+   that are canonical JSON for that kind and the order's second.
 
-   *verify* checks that each signed document is exactly the body that was
+   `publish` checks that each signed document is exactly the body that was
    prepared, carries one signature, and verifies under the kind's key from
-   `trust.json`, by this repository's code and again by the specification's
-   verifier. Only then are `registry/v1/<kind>/index.json`,
-   `registry/v1/<kind>/withdrawn.json` and `state/<kind>.json` written, and
-   *publish* commits the three in one commit. `data` only moves forward.
+   `trust.json` (read afresh, not the copy in the artifact), by this
+   repository's code and again by the specification's verifier, and that
+   `data` still holds the pair the kind was prepared against. Only then are
+   `registry/v1/<kind>/index.json`, `registry/v1/<kind>/withdrawn.json` and
+   `state/<kind>.json` written and committed in one commit. `data` only
+   moves forward.
 
    A kind whose answer is the one signed less than six hours ago, under the
-   key the leg holds, is left as it is.
+   key the job holds, is left as it is.
 3. The plugins service mirrors `data`, verifies each pair again exactly as a
    client does, and serves it.
 
-A kind that cannot be signed fails its own leg and keeps its last signed
+A kind that cannot be signed fails its own job and keeps its last signed
 pair; the other kinds are signed as usual. A failed step prints a code such
 as `E_EXPORT_STALE` and, at most, a location spelt in the schema's own
 words. It never prints a value or a member name from the answer.
@@ -117,7 +125,7 @@ documents and nothing else.
 - A kind's environment `publish-<kind>` holds one secret,
   `ASTRA_<KIND>_SIGNING_KEY`: the private half of one of the kind's two keys.
   Normally that is the **current** key. It is read by one step of that
-  kind's leg; that step reaches no network.
+  kind's `sign` job, the job's one Node command, which reaches no network.
 - The **next** private key stays offline with the operator until the kind is
   rotated (below). The two keys are never in GitHub at the same time.
 - The signer signs with the key in the environment only if its public half
@@ -198,46 +206,142 @@ would move it back. GitHub does not let a secret be read back, so the script rep
 what it uploaded and never what an environment holds; `--no-upload` checks
 the key files against `trust.json` and uploads nothing.
 
-### When both keys of a kind are replaced
+### When a kind cannot be signed over what data holds
 
-The signer builds on the kind's last signed pair only after verifying it
-under the kind's keys in `trust.json`. A ceremony that removes **both** keys
-a pair could have been signed with (it should not be needed: rotate first,
-and the key that signed last is still there) leaves a pair nothing can
-verify, and the kind's legs fail with `E_PREVIOUS_UNVERIFIED`. That is
-deliberate: the alternative is to carry no rows forward. An administrator
-resolves it by hand, by deciding which rows stand.
+The signer builds on a kind's last signed pair only after verifying it, and
+refuses a kind whose files were removed from `data`. Two codes stop a kind
+for good, until an administrator acts; every other kind goes on being signed
+and the stopped kind's last pair stays served.
+
+| code | what `data` holds |
+|---|---|
+| `E_PREVIOUS_UNVERIFIED` | a pair for the kind that no key of the kind in `trust.json` verifies |
+| `E_PREVIOUS_MISSING` | none (or only part) of the kind's three files, although a commit on `data` once held them |
+
+Neither has a switch that starts the kind empty, and none should be added:
+the kind's withdrawn rows live in that pair, and a kind started empty would
+drop every one of them, a confirmed removal under the content rules
+included. In the commands below, `K` is the kind and the clone is of this
+repository, by an administrator:
+
+```sh
+REPO=mihailinl/astra-content-catalogue K=commands
+git clone -q -b data "https://github.com/$REPO" data && cd data
+git log --first-parent --format='%h %an %s' -- "registry/v1/$K" "state/$K.json" | head
+```
+
+Every commit the workflow made is by `astra-content-catalogue` and reads
+`sign <kind>: issued_at <second> under <key id>`. Anything else on `data`
+was written by somebody else, and is the first thing to understand.
+
+**`E_PREVIOUS_UNVERIFIED` after a key ceremony.** A ceremony that removed
+**both** keys a pair could have been signed with (it should not be needed:
+rotate first, and the key that signed last stays in `trust.json`) leaves a
+pair nothing can verify. Nothing on `data` changes; the administrator names
+the pair, by the SHA-256 of its two files, in `recovery.json` on `main`:
+
+```sh
+git show "HEAD:registry/v1/$K/index.json" | sha256sum
+git show "HEAD:registry/v1/$K/withdrawn.json" | sha256sum
+# in a clone of main: add {"kind": K, "index_sha256": …, "withdrawn_sha256": …} to "accept", then
+git commit -m "recovery: build $K on its pair at data <commit>" recovery.json && git push origin main
+```
+
+`main` is updated by administrators only, so the entry is a reviewed
+statement by a person. No ruleset is disabled. The next run carries that
+pair's rows, keeps its serial as the floor, and signs the kind with the key
+the environment holds; from then on the pair on `data` verifies and the
+entry matches nothing, so remove it in a later commit. Nothing is lost.
+
+**`E_PREVIOUS_MISSING`, or an `E_PREVIOUS_UNVERIFIED` pair that the workflow
+did not write.** Somebody wrote `data`, which only the workflow may. Treat it
+as a compromise of whatever could write it (the `publish` job's token, or an
+administrator's account) and deal with that first. Then put the kind's last
+pair the workflow signed back, as a new commit on top: `data` moves forward
+only, and a forced update stays refused for everybody.
+
+```sh
+GOOD=<the last commit by astra-content-catalogue that signed K>
+git checkout "$GOOD" -- "registry/v1/$K" "state/$K.json"
+git -c user.name=operator -c user.email=operator@invalid commit -m "restore $K as signed at $GOOD"
+ID=$(gh api "repos/$REPO/rulesets" --jq '.[] | select(.name == "data: written by the workflow only") | .id')
+gh api --method PUT "repos/$REPO/rulesets/$ID" -f enforcement=disabled   # only this one: "data: forward only" stays on
+git push origin HEAD:data
+gh api --method PUT "repos/$REPO/rulesets/$ID" -f enforcement=active
+gh api "repos/$REPO/rulesets/$ID" --jq .enforcement                       # must print: active
+```
+
+Running `owner/create.sh` again also sets the ruleset back to `active`.
+While it is disabled, anybody with write access can push `data` forward, so
+keep the window to these three commands. What is lost: nothing the workflow
+signed. The restored pair is the one the service last accepted, so its
+serial is the service's floor and the next run signs above it; any commit
+written in between is left in history and not served. If the restored pair
+no longer verifies (a key ceremony happened since), follow the first case
+for it as well.
 
 ## What protects the keys, and what GitHub cannot enforce
 
 | what must hold | what enforces it |
 |---|---|
-| a kind's key is read only by that kind's leg | the secret belongs to the environment `publish-<kind>`; an environment deploys from `main` only |
-| the code a leg runs is the reviewed code on `main` | the ruleset `main: updated by administrators only` |
+| a kind's key is read only by that kind's `sign` job | the secret belongs to the environment `publish-<kind>`; an environment deploys from the branch `main` only |
+| the code that job runs is the reviewed code on `main` | the ruleset `main: updated by administrators only`; the job checks out the run's own commit afresh |
+| nothing an earlier job did reaches the key job but its artifact | jobs run on separate runners; the key job admits the artifact file by file and reads nothing else; no job writes `GITHUB_ENV` or `GITHUB_PATH` |
 | `data` is written only by the workflow, forward only | two rulesets on `data` |
 | the service is asked only by this workflow on `main` | the service pins the token's repository id, workflow, ref and environment |
 
 Two things GitHub does not offer, and what stands in for them:
 
-- **A token cannot be limited to one branch.** A signing leg's token has
+- **A token cannot be limited to one branch.** The `publish` job's token has
   `contents: write`, which it needs to push `data`; the same token could
   push `main`. Nothing in the workflow file can prevent that. The ruleset on
   `main` does: only the repository's admin role may update `main`, and a
-  workflow token is not an administrator. `owner/secrets.sh` refuses to
-  upload any key until that ruleset exists and is active, and until the
-  kind's environment deploys from `main` and from nowhere else.
+  workflow token is not an administrator. The key job's own token has no
+  permission at all. `owner/secrets.sh` refuses to upload any key until that
+  ruleset exists and is active, and until the kind's environment deploys
+  from the branch `main` and from nothing else.
 - **A secret cannot be read back.** Nobody can ask GitHub which key an
   environment holds. So the signer derives the public half of whatever key
   it is given and refuses a key that is not one of the kind's two; and
   `owner/secrets.sh` reads which key signed the kind's documents on `data`
   and refuses to put a current key over a rotation in progress.
 
-Steps of one job share a runner. Keeping the checker out of the step that
-holds the key means no process started by that step, and no process reading
-the service's bytes, ever has the key in its environment; it does not make
-the earlier steps of the same job harmless if they were taken over. The
-answer's strict schema and the checker's isolated start are what stand
-before that.
+### What remains
+
+The key no longer shares a runner with anything that reads the service's
+bytes: the job that holds it starts on a fresh machine, from a fresh
+checkout, with one artifact of four named files as its only input. What
+still stands beside the key:
+
+- **The code on `main`, and the actions it pins.** The key job runs this
+  repository's code at the run's commit, the runner's own Node, and three
+  actions (`checkout`, `download-artifact`, `upload-artifact`) pinned by
+  commit. Whoever can change `main` or those pins can read the key. That is
+  the admin role, through the ruleset.
+- **GitHub.** Its secret store, its runners and its artifact storage are
+  trusted; nothing here can check them.
+- **What `prepare` hands over.** A `prepare` job that was taken over (say,
+  through a flaw in the checker reached by the service's bytes) chooses the
+  bodies the key job signs. The key job still signs only canonical bodies of
+  that one kind, for that one second, under that kind's domains, and
+  `publish` runs the specification's verifier again before anything reaches
+  `data`. Such an attacker gains what a compromised service already has.
+  The signed artifact is readable by anyone for a day in this public
+  repository, so a document signed and then refused by `publish` can still
+  be fetched from there; the service and every client apply the same rules
+  to it and refuse it the same way.
+- **Two compromises together.** An attacker who can write `data` *and*
+  controls the service can put an older pair of a kind back on `data` (it
+  verifies: it was signed here) and have the service omit the withdrawn
+  rows added since. The signer carries forward only what the pair on `data`
+  holds, so those rows leave without a lift and without a failed run. One
+  of the two alone cannot do it: the service alone cannot drop a published
+  row (the row is kept and the run fails), and `data` alone cannot drop one
+  either (the service states the rows afresh). The outside anchor is the
+  service's serial floor per document (SERVE-116): an honest service
+  refuses, and alarms on, a pair below the floor it already served, so the
+  restored pair is noticed unless the service itself is the second
+  compromise.
 
 ## Setting the repository up
 
@@ -271,9 +375,11 @@ commit in a checkout of the source. They are never edited here.
 |---|---|
 | `bin/fetch.mjs` | `work`: ask the service, hand the answers on |
 | `bin/data.mjs` | open `data`; move it forward |
-| `bin/prepare.mjs`, `bin/sign.mjs`, `bin/verify.mjs` | the three middle steps of a leg; `sign.mjs` is the one with the key |
+| `bin/prepare.mjs`, `bin/sign.mjs`, `bin/verify.mjs` | the commands of the `prepare`, `sign` and `publish` jobs; `sign.mjs` is the one with the key |
 | `lib/pipeline.mjs` | prepare and verify: the order of checks |
-| `lib/keystep.mjs` | what the step with the key does, and all it can import |
+| `lib/keystep.mjs` | what the job with the key does, and all it can import |
+| `lib/workdir.mjs` | the two artifacts: their file names, size bounds, and how they are admitted |
+| `lib/recovery.mjs`, `recovery.json` | pairs an administrator has named to build on (see "When a kind cannot be signed over what data holds") |
 | `lib/state.mjs` | the last signed pair on `data`, proven before use |
 | `lib/carry.mjs` | which earlier rows are kept, and how a lift names a row |
 | `lib/export.mjs` | `astra.content.export/1`, exactly, and fresh |
