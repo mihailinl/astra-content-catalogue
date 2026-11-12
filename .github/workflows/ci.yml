@@ -2,7 +2,10 @@
 # Copyright (C) 2026 Minice — https://minice.ai
 #
 # The tests, and the check that the vendored checker, schemas, goldens and
-# signing code still equal the upstream commits vendor/pins.json records.
+# signing code still equal the upstream commits vendor/pins.json records,
+# that those commits are on the upstreams' default branches, and that no
+# vendored file has changed there since. So a change to the specification's
+# checker upstream turns this red until it is vendored again.
 # No secret and no environment: this workflow can sign nothing.
 
 name: CI

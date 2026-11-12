@@ -6,7 +6,10 @@
 // Without a checkout the test still proves that every vendored byte is the
 // one vendor/pins.json recorded, which is what catches an edit made here.
 // With ASTRAPLUGINS_CHECKOUT / ASTRA_REGISTRY_CHECKOUT (CI sets both) it
-// proves each file equals the recorded commit in that checkout.
+// proves each file equals the recorded commit in that checkout, that the
+// commit is an ancestor of the upstream's default branch, and that no
+// vendored file has changed on that branch since: a change to the
+// specification's checker upstream fails CI here until it is vendored again.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -26,8 +29,8 @@ for (const upstream of Object.keys(SOURCES)) {
     assert.equal(readPins()[upstream].repo, SOURCES[upstream].repo);
   });
 
-  test(`${upstream}: every vendored file equals the recorded commit in a checkout`, { skip: CHECKOUTS[upstream] ? false : `set ${upstream === "astraplugins" ? "ASTRAPLUGINS_CHECKOUT" : "ASTRA_REGISTRY_CHECKOUT"}` }, () => {
-    assert.deepEqual(checkVendored({ upstream, checkout: CHECKOUTS[upstream] }), []);
+  test(`${upstream}: the copy is the upstream's default branch, unchanged since the recorded commit`, { skip: CHECKOUTS[upstream] ? false : `set ${upstream === "astraplugins" ? "ASTRAPLUGINS_CHECKOUT" : "ASTRA_REGISTRY_CHECKOUT"}` }, () => {
+    assert.deepEqual(checkVendored({ upstream, checkout: CHECKOUTS[upstream], upstreamRef: `origin/${SOURCES[upstream].watch}` }), []);
   });
 }
 
@@ -58,6 +61,19 @@ test("a vendored file that drifts from a checkout is reported", (t) => {
   assert.deepEqual(check({ checkout }), [], "equal to the checkout");
   assert.deepEqual(check({ checkout, upstreamRef: moved }), [`astraplugins: ${file} changed upstream after the recorded commit (${same}..${moved}); vendor again`]);
 
+  // a commit the checkout holds that was never on the upstream's branch
+  git("checkout", "-q", "--orphan", "elsewhere");
+  git("commit", "-q", "-m", "the same files, on a branch of somebody's own");
+  const stray = git("rev-parse", "HEAD");
+  git("checkout", "-q", "master");
+  pinTo(stray);
+  assert.ok(
+    check({ checkout, upstreamRef: "master" }).includes(`astraplugins: the recorded commit ${stray} is not an ancestor of master`),
+    "a recorded commit that is not on the default branch",
+  );
+  pinTo(same);
+  assert.deepEqual(check({ checkout, upstreamRef: same }), [], "the recorded commit itself");
+
   // the checkout's commit differs from the copy
   pinTo(moved);
   assert.deepEqual(check({ checkout }), [`astraplugins: ${file} differs from mihailinl/AstraPlugins@${moved}`]);
@@ -69,10 +85,10 @@ test("a vendored file that drifts from a checkout is reported", (t) => {
   fs.writeFileSync(vendored, original);
 
   // a file added beside the copies, and one removed
-  const stray = path.join(vendorDir, "astraplugins", "tools", "extra.py");
-  fs.writeFileSync(stray, "");
+  const extra = path.join(vendorDir, "astraplugins", "tools", "extra.py");
+  fs.writeFileSync(extra, "");
   assert.deepEqual(check(), ["astraplugins: tools/extra.py is in vendor/ and not in pins.json"]);
-  fs.rmSync(stray);
+  fs.rmSync(extra);
   fs.rmSync(vendored);
   assert.deepEqual(check(), [`astraplugins: ${file} is recorded and not vendored`]);
   fs.writeFileSync(vendored, original);
