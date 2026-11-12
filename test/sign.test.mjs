@@ -196,34 +196,40 @@ test("over_one_mebibyte_is_not_signed", (t) => {
   assert.equal(fs.statSync(path.join(dataDir, documentPath("commands", "index"))).size, ok.bytes.index);
 });
 
-test("the_signer_signs_with_the_current_key_only", (t) => {
+test("the_signer_signs_only_with_one_of_the_kinds_two_trusted_keys", (t) => {
   const { trust, seeds } = throwawayTrust();
   const answer = exportOf("packs", { entries: golden("index/packs/valid.json").signed.entries });
-  const attempt = (secret) => {
-    const dir = scratch(t);
-    const report = run(t, { dir, kind: "packs", export: answer, trust, secret });
+  const attempt = (secret, o = {}) => {
+    const dir = o.dir ?? scratch(t);
+    const report = run(t, { dir, kind: "packs", export: o.export ?? answer, trust: o.trust ?? trust, secret, now: o.now ?? NOW });
     return { report, dir: path.join(dir, "data") };
   };
-  const nothing = (secret, code) => {
+  const nothing = (secret, code, o = {}) => {
     const dir = scratch(t);
-    assert.throws(() => run(t, { dir, kind: "packs", export: answer, trust, secret }), refusal(code));
+    assert.throws(() => run(t, { dir, kind: "packs", export: answer, trust: o.trust ?? trust, secret, now: o.now ?? NOW }), refusal(code));
     assert.deepEqual(snapshot(path.join(dir, "data")), {}, `${code}: nothing is written`);
   };
 
-  nothing(seedSecret(seeds.packs.next), "E_KEY_IS_NEXT");
-  nothing(seedSecret(seeds.models.current), "E_KEY_NOT_CURRENT");
-  nothing(seedSecret(crypto.randomBytes(32)), "E_KEY_NOT_CURRENT");
+  // a key of another kind, current or next; a key trust.json does not hold; no key; not a key
+  nothing(seedSecret(seeds.models.current), "E_KEY_NOT_TRUSTED");
+  nothing(seedSecret(seeds.models.next), "E_KEY_NOT_TRUSTED");
+  nothing(seedSecret(crypto.randomBytes(32)), "E_KEY_NOT_TRUSTED");
   nothing(undefined, "E_KEY_ABSENT");
   nothing("  \n", "E_KEY_ABSENT");
   nothing("not a key", "E_KEY_FORMAT");
   nothing(crypto.randomBytes(31).toString("base64"), "E_KEY_FORMAT");
 
-  const { dir } = attempt(seedSecret(seeds.packs.current));
-  for (const doc of DOCS) {
-    const env = read(dir, "packs", doc);
-    assert.deepEqual(env.signatures.map((s) => s.key_id), ["astra-packs-testa"], `${doc}: one signature, by the current key`);
-    const verdict = checkDocument({ file: path.join(dir, documentPath("packs", doc)), kind: "packs", doc, now: NOW, trust: trust.signed });
-    assert.deepEqual(verdict.verified_by, ["astra-packs-testa"]);
+  // either key of the kind signs, alone, under its own key id, and the verifier names it
+  for (const [role, keyId] of [["current", "astra-packs-testa"], ["next", "astra-packs-testb"]]) {
+    const { report, dir } = attempt(seedSecret(seeds.packs[role]));
+    assert.deepEqual({ key_id: report.key_id, role: report.role }, { key_id: keyId, role });
+    for (const doc of DOCS) {
+      const env = read(dir, "packs", doc);
+      assert.deepEqual(env.signatures.map((s) => s.key_id), [keyId], `${doc}: one signature, by the key in the job`);
+      const verdict = checkDocument({ file: path.join(dir, documentPath("packs", doc)), kind: "packs", doc, now: NOW, trust: trust.signed });
+      assert.deepEqual(verdict.verified_by, [keyId]);
+    }
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, statePath("packs")), "utf8")).key_id, keyId);
   }
   // the same key as a PKCS#8 PEM, with the newline a file ends in
   const pem = crypto
@@ -232,10 +238,43 @@ test("the_signer_signs_with_the_current_key_only", (t) => {
   assert.equal(attempt(`${pem}\n`).report.key_id, "astra-packs-testa");
   assert.equal(attempt(`${seedSecret(seeds.packs.current)}\n`).report.outcome, "signed");
 
-  // a current key that is not valid yet signs nothing either
-  const early = throwawayTrust({ now: NOW + 40 * 86400 });
-  const dir2 = scratch(t);
-  assert.throws(() => run(t, { dir: dir2, kind: "packs", export: answer, trust: early.trust, secret: seedSecret(early.seeds.packs.current), now: NOW }), refusal("E_KEY_NOT_YET"));
+  // a trusted key signs nothing before its not_before: the next key between the two starts, either key before both
+  const late = throwawayTrust({ now: NOW + 40 * 86400 }); // current from NOW + 10 d, next from NOW + 11 d
+  nothing(seedSecret(late.seeds.packs.current), "E_KEY_NOT_YET", { trust: late.trust });
+  nothing(seedSecret(late.seeds.packs.next), "E_KEY_NOT_YET", { trust: late.trust, now: NOW + 10 * 86400 + 3600 });
+  assert.equal(attempt(seedSecret(late.seeds.packs.current), { trust: late.trust, now: NOW + 10 * 86400 + 3600 }).report.role, "current");
+  assert.equal(attempt(seedSecret(late.seeds.packs.next), { trust: late.trust, now: NOW + 11 * 86400 }).report.role, "next");
+});
+
+test("a rotation: the next key signs at once, and the current key does not sign again", (t) => {
+  const { trust, seeds } = throwawayTrust();
+  const dir = scratch(t);
+  const dataDir = path.join(dir, "data");
+  const answer = exportOf("models", { entries: golden("index/models/valid.json").signed.entries });
+  const base = { dir, dataDir, kind: "models", export: answer, trust };
+  assert.equal(run(t, { ...base, secret: seedSecret(seeds.models.current), now: NOW }).key_id, "astra-models-testa");
+
+  // ten minutes later the environment holds the next key: the unchanged answer is signed again, now
+  const rotated = run(t, { ...base, secret: seedSecret(seeds.models.next), now: NOW + 600 });
+  assert.deepEqual({ outcome: rotated.outcome, key_id: rotated.key_id, role: rotated.role, issued_at: rotated.issued_at }, { outcome: "signed", key_id: "astra-models-testb", role: "next", issued_at: NOW + 600 });
+  const after = snapshot(dataDir);
+
+  // the switch is one-way: the old key back in the environment signs nothing
+  assert.throws(() => run(t, { ...base, secret: seedSecret(seeds.models.current), now: NOW + 1200 }), refusal("E_KEY_SWITCHED_BACK"));
+  assert.deepEqual(snapshot(dataDir), after);
+
+  // the ceremony later names that key current, with a new next: the same secret goes on signing
+  const promoted = throwawayTrust({
+    mutate: (signed) => {
+      const fresh = signed.kind_keys.find((k) => k.kind === "models" && k.role === "next");
+      signed.kind_keys = signed.kind_keys.filter((k) => k.kind !== "models").concat([
+        { ...trust.kindKeys("models").next, role: "current", notBefore: undefined },
+        { ...fresh, key_id: "astra-models-testc", not_before: "2026-12-30T00:00:00Z" },
+      ]);
+    },
+  });
+  const later = run(t, { ...base, trust: promoted.trust, secret: seedSecret(seeds.models.next), now: NOW + 7 * 3600 });
+  assert.deepEqual({ outcome: later.outcome, key_id: later.key_id, role: later.role }, { outcome: "signed", key_id: "astra-models-testb", role: "current" });
 });
 
 test("an_export_with_an_account_fact_is_refused", (t) => {
@@ -297,7 +336,7 @@ test("a document the specification's checker refuses is not signed", (t) => {
   }
 });
 
-test("an unchanged kind is signed again only after six hours, or under a new current key", (t) => {
+test("an unchanged kind is signed again only after six hours, or under another key", (t) => {
   const { trust, seeds } = throwawayTrust();
   const dir = scratch(t);
   const dataDir = path.join(dir, "data");
@@ -307,7 +346,7 @@ test("an unchanged kind is signed again only after six hours, or under a new cur
   const first = snapshot(dataDir);
 
   const soon = run(t, { ...base, export: { ...answer, generated_at: "2026-12-31T05:00:00Z" }, now: NOW + RESIGN_AFTER - 1 });
-  assert.deepEqual(soon, { kind: "animsets", outcome: "unchanged", issued_at: NOW, key_id: "astra-animsets-testa", carried: 0 });
+  assert.deepEqual(soon, { kind: "animsets", outcome: "unchanged", issued_at: NOW, key_id: "astra-animsets-testa", role: "current", carried: 0 });
   assert.deepEqual(snapshot(dataDir), first);
 
   assert.equal(run(t, { ...base, export: answer, now: NOW + RESIGN_AFTER }).issued_at, NOW + RESIGN_AFTER);

@@ -40,7 +40,7 @@ contract, §4.7 (BOT-110, BOT-111, TRUST-50, SERVE-116).
    - checks both documents with the specification's own checker (schema,
      semantic rules, pairing rules) and refuses a document over 1,048,576
      bytes, **before** the key is used;
-   - signs both with the kind's current key, under the domains
+   - signs both with the kind's key (see Keys), under the domains
      `astra.<kind>.index/1` and `astra.<kind>.withdrawn/1`;
    - verifies what it signed with the public key from `trust.json`;
    - commits `registry/v1/<kind>/index.json`, `registry/v1/<kind>/withdrawn.json`
@@ -81,11 +81,16 @@ Each kind has two keys in the plugin registry's root-signed
 (`kind_keys`): `current` and `next`. A kind key verifies that kind's two
 documents and nothing else.
 
-- The **current** private key of a kind is the single secret
-  `ASTRA_<KIND>_SIGNING_KEY` of the environment `publish-<kind>`. It is read
-  by one step of that kind's leg; that step reaches no network.
-- The **next** private key stays offline with the operator. It is not a
-  secret of any environment here, and the signer refuses to sign with it.
+- A kind's environment `publish-<kind>` holds one secret,
+  `ASTRA_<KIND>_SIGNING_KEY`: the private half of one of the kind's two keys.
+  Normally that is the **current** key. It is read by one step of that
+  kind's leg; that step reaches no network.
+- The **next** private key stays offline with the operator until the kind is
+  rotated (below). The two keys are never in GitHub at the same time.
+- The signer signs with the key in the environment only if its public half
+  is the kind's current or next key in `trust.json` and that key's
+  `not_before` has passed. Any other key, another kind's included, signs
+  nothing.
 - `trust.json` is read from astra-registry at every run and is believed only
   when it verifies under the root keys compiled into this repository
   (`vendor/astra-registry/bot/lib/roots.mjs`).
@@ -119,27 +124,43 @@ It **cannot**:
   the export schema is refused, and only `registry/` and `state/` are
   committed.
 
-A stolen current key of one kind can sign that kind's two documents and
-nothing else, until the kind is rotated.
+A stolen key of one kind can sign that kind's two documents and nothing
+else, until the kind is rotated.
 
 ## Rotating a key
 
-Rotation is an operator act and needs no change here.
+Rotation is an operator act. It needs no change here and leaves no time in
+which a kind is unsigned.
 
-1. The operator re-signs `trust.json` so that the kind's `next` row becomes
-   its `current` row and a new `next` row is added, and publishes it in
-   astra-registry. Clients and the service already accept both keys of the
-   earlier `trust.json`, so documents signed with either verify during the
-   change.
-2. The operator runs `owner/secrets.sh <keys-dir> --rotate <kind>`. It
-   derives the public half of the private key locally, uploads the key only
-   if it is the one `trust.json` now names current for that kind, and prints
-   the kind, the key id and `match` or `mismatch`.
-3. The next run signs both of the kind's documents under the new current
-   key. Until step 2 the legs of that kind fail (the old key is no longer
-   current) and the kind keeps its last signed pair. Do step 2 straight
-   after step 1: an index stays valid for up to seven days, but a client
-   treats a withdrawn document as stale 26 hours after it was signed.
+1. The operator runs `owner/secrets.sh <keys-dir> --rotate <kind>`. It
+   derives the public half of the kind's **next** private key locally,
+   refuses unless it equals the kind's next row in `trust.json` and that row
+   is valid now, replaces the environment's secret with it, and prints the
+   kind, the key id and `ROTATING`.
+2. The next run signs both of the kind's documents with that key, at once,
+   whether or not the service's answer changed. Clients and the service
+   already accept either key of the kind, so nothing else has to happen for
+   the documents to verify. The run's log says that it signed with the next
+   key; that is not a failure.
+3. The trust change follows whenever the root ceremony is held: `trust.json`
+   is re-signed so that this key is the kind's `current` row and a new
+   `next` row is added. The signer goes on signing with the same secret.
+
+The switch is one-way. A client that has verified a document signed with a
+kind's next key refuses a later document of that kind signed with the old
+key alone, so the signer refuses to sign a kind with its current key once it
+has signed that kind with the next one.
+
+**If a current key is compromised: rotate first, then hold the ceremony.**
+Step 1 takes minutes and needs no ceremony; from the first document signed
+with the next key, clients that have seen it no longer accept the
+compromised key for that kind's documents. The ceremony then removes the
+compromised key from `trust.json` for everyone.
+
+A plain `owner/secrets.sh <keys-dir>` uploads current keys only and refuses a
+next key. GitHub does not let a secret be read back, so the script reports
+what it uploaded and never what an environment holds; `--no-upload` checks
+the key files against `trust.json` and uploads nothing.
 
 ## Setting the repository up
 
@@ -148,7 +169,7 @@ of the repository. Neither is run by a workflow.
 
 ```sh
 owner/create.sh                 # environments (main only), rulesets for main and data; prints the repository id and owner id
-owner/secrets.sh <keys-dir>     # each kind's current key into its environment
+owner/secrets.sh <keys-dir>     # each kind's current key into its environment (--rotate <kind>: that kind's next key)
 ```
 
 The repository id and owner id that `create.sh` prints are the ones the
@@ -176,7 +197,7 @@ commit in a checkout of the source. They are never edited here.
 | `lib/pipeline.mjs` | the order of checks around one signing |
 | `lib/carry.mjs` | which earlier rows are kept, and how a lift names a row |
 | `lib/export.mjs` | `astra.content.export/1`, exactly |
-| `lib/signer.mjs`, `lib/trust.mjs` | the current key and the root-signed `trust.json` |
+| `lib/signer.mjs`, `lib/trust.mjs` | which key may sign, and the root-signed `trust.json` |
 | `lib/check.py`, `lib/checker.mjs` | the bridge to the specification's checker |
 | `owner/` | the operator's two scripts |
 

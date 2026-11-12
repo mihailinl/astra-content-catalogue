@@ -109,45 +109,68 @@ test("owner/secrets: a key that is not the kind's current key uploads nothing, f
   const gh = fakeGh(t);
   const dir = keysDir(t, trust);
   cases["the next key under the current key's file name"](dir);
-  assert.ok((await secrets(t, trust, [dir], gh)).lines.some((l) => l.includes("NEXT key")));
+  assert.ok((await secrets(t, trust, [dir], gh)).lines.some((l) => l.includes("NEXT key") && l.includes("--rotate")));
 });
 
-test("owner/secrets --rotate: after trust.json names a new current key, that key and only that kind", async (t) => {
-  const before = throwawayTrust();
+test("owner/secrets --rotate: the kind's next key, and only that, before any trust change", async (t) => {
+  const trust = throwawayTrust();
   const gh = fakeGh(t);
-  const dir = keysDir(t, before);
-  assert.equal((await secrets(t, before, [dir], gh)).code, 0);
+  const dir = keysDir(t, trust);
+  const slot = `${REPO}/publish-animsets/ASTRA_ANIMSETS_SIGNING_KEY`;
+  const held = () => Buffer.from(gh.state().secrets[slot], "base64").toString().trim();
+  assert.equal((await secrets(t, trust, [dir], gh)).code, 0);
+  assert.equal(held(), seedSecret(trust.seeds.animsets.current));
 
-  // Before the trust change, the next key cannot be uploaded: no option reaches it.
-  const early = await secrets(t, before, [dir, "--rotate", "animsets"], gh);
-  assert.deepEqual(early.lines.slice(0, 2), ["animsets astra-animsets-testa match", "animsets astra-animsets-testa uploaded to publish-animsets"]);
-  assert.equal(Buffer.from(gh.state().secrets[`${REPO}/publish-animsets/ASTRA_ANIMSETS_SIGNING_KEY`], "base64").toString().trim(), seedSecret(before.seeds.animsets.current));
+  const count = gh.calls().length;
+  const rotated = await secrets(t, trust, [dir, "--rotate", "animsets"], gh);
+  assert.equal(rotated.code, 0);
+  assert.deepEqual(rotated.lines, [
+    "animsets astra-animsets-testb ROTATING",
+    "animsets astra-animsets-testb uploaded to publish-animsets",
+    "animsets: the next Sign run signs both documents with astra-animsets-testb; the trust change that names it current can follow",
+  ]);
+  assert.equal(gh.calls().length, count + 1, "one upload, for the one kind");
+  assert.equal(held(), seedSecret(trust.seeds.animsets.next));
+  await assert.rejects(secrets(t, trust, [dir, "--rotate", "games"], gh), /is not one of/);
 
-  // The ceremony: animsets' old next key becomes current, and a new next key appears.
+  // --rotate uploads nothing but the next key, and not before it is valid
+  const refusedRotate = async (name, damage, why, when = trust) => {
+    const gh2 = fakeGh(t);
+    const d = keysDir(t, when);
+    damage(d);
+    const r = await secrets(t, when, [d, "--rotate", "animsets"], gh2);
+    assert.equal(r.code, 1, name);
+    assert.ok(r.lines[0].startsWith("animsets ") && r.lines[0].includes("mismatch") && r.lines[0].includes(why), `${name}: ${r.lines[0]}`);
+    assert.deepEqual(gh2.calls(), [], `${name}: gh is never called`);
+  };
+  const next = (d) => path.join(d, "astra-animsets-testb.seed.b64");
+  await refusedRotate("the current key under the next key's name", (d) => fs.copyFileSync(path.join(d, "astra-animsets-testa.seed.b64"), next(d)), "CURRENT key");
+  await refusedRotate("another kind's next key", (d) => fs.copyFileSync(path.join(d, "astra-packs-testb.seed.b64"), next(d)), "is not the key trust.json names next");
+  await refusedRotate("a key trust.json does not hold", (d) => fs.writeFileSync(next(d), `${seedSecret(crypto.randomBytes(32))}\n`), "is not the key trust.json names next");
+  await refusedRotate("a PEM that disagrees", (d) => fs.writeFileSync(path.join(d, "astra-animsets-testb.private.pem"), pemOf(crypto.randomBytes(32))), "is not the key trust.json names next");
+  await refusedRotate("a next key that is not valid yet", () => {}, "is not valid before", throwawayTrust({ now: NOW + 40 * 86400 }));
+
+  // After the ceremony names the rotated key current, a plain run reports it as a match.
   const after = throwawayTrust({
-    suffixes: ["a", "b"],
     mutate: (signed) => {
-      const fresh = crypto.randomBytes(32);
+      const fresh = signed.kind_keys.find((k) => k.kind === "animsets" && k.role === "next");
       signed.kind_keys = signed.kind_keys.flatMap((row) => {
-        const old = before.trust.kindKeys(row.kind)[row.role];
-        if (row.kind !== "animsets") return [{ ...old }];
-        if (row.role === "current") return [{ ...before.trust.kindKeys("animsets").next, role: "current" }];
-        const pub = crypto.createPublicKey(crypto.createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), fresh]), format: "der", type: "pkcs8" })).export({ format: "der", type: "spki" });
-        return [{ ...row, key_id: "astra-animsets-testc", public_key: pub.subarray(pub.length - 32).toString("base64"), not_before: "2026-12-30T00:00:00Z" }];
+        if (row.kind !== "animsets") return [{ ...trust.trust.kindKeys(row.kind)[row.role], notBefore: undefined }];
+        if (row.role === "current") return [{ ...trust.trust.kindKeys("animsets").next, role: "current", notBefore: undefined }];
+        return [{ ...fresh, key_id: "astra-animsets-testc", not_before: "2026-12-30T00:00:00Z" }];
       });
     },
   });
-  const count = gh.calls().length;
-  const rotated = await secrets(t, after, [dir, "--rotate", "animsets"], gh);
-  assert.equal(rotated.code, 0);
-  assert.deepEqual(rotated.lines, [
-    "animsets astra-animsets-testb match",
-    "animsets astra-animsets-testb uploaded to publish-animsets",
-    "animsets: the next Sign run signs both documents under the new current key",
-  ]);
-  assert.equal(gh.calls().length, count + 1, "one upload");
-  assert.equal(Buffer.from(gh.state().secrets[`${REPO}/publish-animsets/ASTRA_ANIMSETS_SIGNING_KEY`], "base64").toString().trim(), seedSecret(before.seeds.animsets.next));
-  await assert.rejects(secrets(t, after, [dir, "--rotate", "games"], gh), /is not one of/);
+  const before = gh.calls().length;
+  const dry = await secrets(t, after, [dir, "--no-upload"], gh);
+  assert.equal(dry.code, 0);
+  assert.ok(dry.lines.includes("animsets astra-animsets-testb match"));
+  assert.ok(dry.lines.includes("animsets: current key id astra-animsets-testb; upload skipped (--no-upload)"));
+  assert.equal(gh.calls().length, before, "--no-upload never calls gh");
+  // without --no-upload it uploads the same key again, and says that it uploaded: it cannot know what GitHub holds
+  const plain = await secrets(t, after, [dir], gh);
+  assert.ok(plain.lines.includes("animsets astra-animsets-testb uploaded to publish-animsets"));
+  assert.equal(held(), seedSecret(trust.seeds.animsets.next));
 });
 
 test("owner/secrets as shipped believes only the compiled roots, and fails when gh does", async (t) => {

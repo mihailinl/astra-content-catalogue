@@ -4,7 +4,7 @@
 //
 // sign.yml, job `sign`, the step that holds the key: sign one kind.
 //
-//   CONTENT_SIGNING_KEY=<the kind's current key> \
+//   CONTENT_SIGNING_KEY=<one of the kind's two keys> \
 //   node bin/sign.mjs --kind <kind> --exports <dir> --data <dir> --trust <trust.json> --report <file>
 //
 // It reads the export the `work` job left, the kind's last signed documents
@@ -66,6 +66,10 @@ export function main(argv, { env = process.env, now = Math.floor(Date.now() / 10
           ? `${kind}: service door not open`
           : `${kind}: not signed (${report.code}); the last signed documents stay`;
   log(line);
+  if (report.role === "next") {
+    // not a failure: this is a rotation in progress (README, "Rotating a key")
+    log(`${kind}: signing with the kind's NEXT key (${report.key_id}); trust.json still names the other key current`);
+  }
   appendTo("GITHUB_STEP_SUMMARY", line, env);
   return report;
 }
