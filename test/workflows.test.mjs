@@ -68,14 +68,15 @@ test("one_job_reads_one_kinds_key", () => {
   assert.equal(sign.strategy["fail-fast"], false);
   assert.deepEqual(sign.permissions, {}, "the key job's token has no permission: no contents, no OIDC token");
   assert.deepEqual(sign.env, { KIND: "${{ matrix.kind }}" }, "the job's environment is the kind's name and nothing else");
-  assert.equal(sign.outputs, undefined, "the key job hands nothing on but its artifact");
+  // what leaves the key job: one job output per kind, set by the key step, and no artifact
+  assert.deepEqual(sign.outputs, Object.fromEntries(KINDS.map((k) => [k, `\${{ steps.sign.outputs.${k} }}`])), "one output per kind, so that the legs do not overwrite one another");
   assert.equal(sign.needs, "prepare", "the key job waits on the preparing job alone");
 
   // its steps: one fresh checkout of this commit, one download of the kind's prepared artifact,
-  // ONE node command, one upload; no setup action, no script, nothing else
+  // ONE node command; no setup action, no script, no upload, nothing else
   const shape = sign.steps.map((s) => (s.uses ? s.uses.split("@")[0] : `run:${s.run.split(" ").slice(0, 2).join(" ")}`));
-  assert.deepEqual(shape, ["actions/checkout", "actions/download-artifact", "run:node bin/sign.mjs", "actions/upload-artifact"]);
-  const [checkout, download, key, upload] = sign.steps;
+  assert.deepEqual(shape, ["actions/checkout", "actions/download-artifact", "run:node bin/sign.mjs"]);
+  const [checkout, download, key] = sign.steps;
   assert.deepEqual(checkout.with, { ref: "${{ github.sha }}", "persist-credentials": false }, "a fresh checkout of the same commit, no credential");
   // its input is the artifact the preparing job uploaded for this kind, and only that
   const prepared = prepare.steps.find((s) => s.uses?.startsWith("actions/upload-artifact@"));
@@ -86,10 +87,13 @@ test("one_job_reads_one_kinds_key", () => {
   assert.deepEqual(key.env, { CONTENT_SIGNING_KEY: "${{ secrets[matrix.secret] }}" }, "the key step sees the key and no token");
   assert.equal(key.shell, undefined);
   assert.equal(key.run, 'node bin/sign.mjs --kind "$KIND" --work "$RUNNER_TEMP/prepared" --out "$RUNNER_TEMP/signed"', "one Node file and nothing else: no second command, no pipe, no substitution");
-  // its output is the signed artifact, and the publishing job takes it from there
-  assert.deepEqual(upload.with.name, "signed-${{ matrix.kind }}");
-  assert.equal(upload.with.path, "${{ runner.temp }}/signed");
-  assert.ok(publish.steps.some((s) => s.uses?.startsWith("actions/download-artifact@") && s.with.name === "signed-${{ matrix.kind }}"));
+  assert.equal(key.id, "sign");
+  // no signed document is ever an artifact (a public repository's artifacts can be downloaded by anyone):
+  // publish takes the key job's line for its kind, in the verifying step's environment
+  assert.ok(!text("sign.yml").includes("signed-"), "no artifact named signed-<kind>");
+  assert.deepEqual(publish.steps.filter((s) => s.uses?.startsWith("actions/download-artifact@")).map((s) => s.with.name), ["prepared-${{ matrix.kind }}"]);
+  const verifyStep = publish.steps.find((s) => s.run?.startsWith("node bin/verify.mjs"));
+  assert.deepEqual(verifyStep.env, { SIGNED_RESULT: "${{ needs.sign.outputs[matrix.kind] }}" });
 
   // the work job checks every answer before it becomes an artifact: the upload comes after the fetch, and takes its output dir
   const fetchAt = work.steps.findIndex((s) => s.id === "fetch");
@@ -106,7 +110,7 @@ test("one_job_reads_one_kinds_key", () => {
   ]);
   assert.deepEqual(runs(publish), [
     { run: "node bin/data.mjs open", env: ["GITHUB_TOKEN"] },
-    { run: "node bin/verify.mjs", env: [] },
+    { run: "node bin/verify.mjs", env: ["SIGNED_RESULT"] },
     { run: "node bin/data.mjs publish", env: ["GITHUB_TOKEN"] },
   ]);
   assert.equal(publish.strategy["max-parallel"], 1, "one push to data at a time");

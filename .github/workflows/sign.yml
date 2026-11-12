@@ -25,18 +25,25 @@
 #             It does three things and nothing else: a fresh checkout of this
 #             commit, a download of its kind's prepared artifact, and ONE Node
 #             command (bin/sign.mjs) that starts no process and opens no
-#             connection. It uploads the signed artifact. It runs no Python,
+#             connection, and refuses an order whose second is not its own
+#             clock. What it hands on is one line of job output per kind (the
+#             result and the two signatures), never an artifact: artifacts of
+#             a public repository can be downloaded by anyone, and a signed
+#             document must not be one before `publish` has checked it. It runs no Python,
 #             no git of its own, no setup action, and nothing an earlier job
 #             could have changed: the runner is new, the checkout is new, and
 #             the artifact is admitted file by file before it is read.
-#   publish   one leg per kind, one after another. No key. Proves that what
-#             was signed is what was prepared and that it verifies, then
-#             moves `data` forward (bin/verify.mjs, bin/data.mjs).
+#   publish   one leg per kind, one after another. No key. Rebuilds the two
+#             documents from the prepared bodies and the key job's line,
+#             proves that they verify, that the order's second is its own
+#             clock and later than the serial on `data`, then moves `data`
+#             forward (bin/verify.mjs, bin/data.mjs).
 #
-# What crosses from one job to the next is an artifact and nothing else. A
+# What crosses from one job to the next is an artifact, and from the key job
+# to `publish` one line of job output per kind; nothing else. A
 # job's environment and PATH are its own: GITHUB_ENV and GITHUB_PATH are
 # files on one runner and end with its job, and this workflow writes neither.
-# No job output is read by the key job's steps.
+# No job output is read by the key job.
 #
 # A leg's environment and secret are spelt out in the `sign` matrix below, one
 # line each, and test/workflows.test.mjs holds that table to lib/kinds.mjs.
@@ -200,6 +207,14 @@ jobs:
             secret: ASTRA_PACKS_SIGNING_KEY
     environment: ${{ matrix.environment }}
     permissions: {}
+    # what leaves the key job: one line per kind, the result and the two
+    # signatures; never a signed document as an artifact (lib/workdir.mjs)
+    outputs:
+      commands: ${{ steps.sign.outputs.commands }}
+      characters: ${{ steps.sign.outputs.characters }}
+      models: ${{ steps.sign.outputs.models }}
+      animsets: ${{ steps.sign.outputs.animsets }}
+      packs: ${{ steps.sign.outputs.packs }}
     env:
       KIND: ${{ matrix.kind }}
     steps:
@@ -216,18 +231,10 @@ jobs:
           path: ${{ runner.temp }}/prepared
 
       - name: Sign the kind (the key)
+        id: sign
         env:
           CONTENT_SIGNING_KEY: ${{ secrets[matrix.secret] }}
         run: node bin/sign.mjs --kind "$KIND" --work "$RUNNER_TEMP/prepared" --out "$RUNNER_TEMP/signed"
-
-      - name: Hand the signed documents to the publishing job
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: signed-${{ matrix.kind }}
-          path: ${{ runner.temp }}/signed
-          if-no-files-found: error
-          retention-days: 1
 
   publish:
     name: Verify and publish ${{ matrix.kind }}
@@ -271,18 +278,14 @@ jobs:
           name: prepared-${{ matrix.kind }}
           path: ${{ runner.temp }}/prepared
 
-      - name: Take what was signed
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: signed-${{ matrix.kind }}
-          path: ${{ runner.temp }}/signed
-
       - name: Open the data branch
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node bin/data.mjs open --dir "$RUNNER_TEMP/data"
 
       - name: Verify what was signed
+        env:
+          SIGNED_RESULT: ${{ needs.sign.outputs[matrix.kind] }}
         run: >-
           node bin/verify.mjs --kind "$KIND"
           --work "$RUNNER_TEMP/prepared"

@@ -43,10 +43,14 @@ function leg(t, { remote, kind, answer, trust, secret, now, status = "fetched" }
   const trustFile = path.join(dir, "trust.json");
   fs.writeFileSync(trustFile, JSON.stringify(trust.doc));
   const prepared = path.join(dir, "prepared");
-  const signed = path.join(dir, "signed");
+  const keyOut = path.join(dir, "key-job"); // on the key job's runner only
+  const signed = path.join(dir, "signed"); // rebuilt by the publishing job
+  const outputs = path.join(dir, "outputs");
   const log = [];
   const o = { now, roots: trust.roots, log: (l) => log.push(l) };
-  const env = { CONTENT_SIGNING_KEY: secret };
+  const env = { CONTENT_SIGNING_KEY: secret, GITHUB_OUTPUT: outputs };
+  // what the publishing job reads: the key job's output for this kind, as `needs.sign.outputs[kind]`
+  const output = () => (fs.existsSync(outputs) ? fs.readFileSync(outputs, "utf8").split("\n").find((l) => l.startsWith(`${kind}=`))?.slice(kind.length + 1) : undefined);
   const dataP = path.join(dir, "data-prepare");
   const dataV = path.join(dir, "data-publish");
   const jobs = [
@@ -54,10 +58,10 @@ function leg(t, { remote, kind, answer, trust, secret, now, status = "fetched" }
       ["open", () => dataMain(["open", "--dir", dataP, "--remote", remote], { env: {}, log: o.log })],
       ["prepare", () => prepareMain(["--kind", kind, "--exports", exportsDir, "--data", dataP, "--trust", trustFile, "--work", prepared], { ...o, env: {} })],
     ],
-    [["sign", () => signMain(["--kind", kind, "--work", prepared, "--out", signed], { ...o, env })]],
+    [["sign", () => signMain(["--kind", kind, "--work", prepared, "--out", keyOut], { ...o, env })]],
     [
       ["open", () => dataMain(["open", "--dir", dataV, "--remote", remote], { env: {}, log: o.log })],
-      ["verify", () => verifyMain(["--kind", kind, "--work", prepared, "--signed", signed, "--data", dataV, "--trust", trustFile], { ...o, env: {} })],
+      ["verify", () => verifyMain(["--kind", kind, "--work", prepared, "--signed", signed, "--data", dataV, "--trust", trustFile], { ...o, env: { SIGNED_RESULT: output() ?? "" } })],
       ["publish", () => dataMain(["publish", "--dir", dataV, "--signed", signed], { env: {}, log: o.log })],
     ],
   ];

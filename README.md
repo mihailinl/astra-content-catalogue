@@ -32,15 +32,19 @@ contract, §4.7 (BOT-110, BOT-111, TRUST-50, SERVE-116).
    only then copied where the job's artifact is taken from; an answer that
    fails never becomes an artifact.
 2. Then each kind goes through three jobs, each on a fresh runner of its
-   own. What passes from one job to the next is an artifact of fixed file
-   names, admitted file by file (name, regular file, size bound) before
-   anything in it is read, and nothing else: no job output, no variable, no
-   file on a shared disk.
+   own. What passes from `prepare` to the later jobs is an artifact of
+   fixed file names, admitted file by file (name, regular file, size bound)
+   before anything in it is read. What passes from `sign` to `publish` is
+   one line of job output per kind: the result and the two signatures,
+   never a signed document. Artifacts of a public repository can be
+   downloaded by anyone, and a signed document must not be one before
+   `publish` has checked it. Nothing else crosses: no variable, no file on a
+   shared disk.
 
    | job | holds | does |
    |---|---|---|
    | `prepare` | a token that can only read | reads the answer and the kind's last signed pair on `data`, runs the specification's checker, uploads `prepared-<kind>`: the two **unsigned** bodies, an order and the `trust.json` it used |
-   | `sign` | **the kind's key**, and a token with no permission at all | a fresh checkout of the same commit, a download of `prepared-<kind>`, **one** Node command (`bin/sign.mjs`) that starts no process and opens no connection, an upload of `signed-<kind>`: the two signed documents |
+   | `sign` | **the kind's key**, and a token with no permission at all | a fresh checkout of the same commit, a download of `prepared-<kind>`, **one** Node command (`bin/sign.mjs`) that starts no process and opens no connection; its job output is the result and the two signatures |
    | `publish` | a token that can write contents, and no key | proves what was signed is what was prepared and verifies, then one commit on `data`, pushed forward; one kind at a time |
 
    The code that parses bytes the service chose, and the specification's
@@ -70,10 +74,19 @@ contract, §4.7 (BOT-110, BOT-111, TRUST-50, SERVE-116).
 
    `sign` signs both with the kind's key (see Keys), under the domains
    `astra.<kind>.index/1` and `astra.<kind>.withdrawn/1`, and only bodies
-   that are canonical JSON for that kind and the order's second.
+   that are canonical JSON for that kind and the order's second, and only
+   when that second is its own clock: no more than 15 minutes behind and
+   one minute ahead (`E_ORDER_CLOCK`). The preparing job's word for the time
+   is not taken: a second months ahead, once signed, would freeze the kind
+   behind every client's serial floor until `trust.json` expired. The key
+   must be valid both at that second and at the job's clock.
 
-   `publish` checks that each signed document is exactly the body that was
-   prepared, carries one signature, and verifies under the kind's key from
+   `publish` rebuilds each signed document from the prepared body and the
+   key job's signature, checks the order's second against its own clock
+   (the same window) and against the serial of the pair it verified on
+   `data` itself (later, never equal or earlier), and checks that each
+   document is exactly the body that was prepared, carries one signature,
+   and verifies under the kind's key from
    `trust.json` (read afresh, not the copy in the artifact), by this
    repository's code and again by the specification's verifier, and that
    `data` still holds the pair the kind was prepared against. Only then are
@@ -319,8 +332,7 @@ still stands beside the key:
 
 - **The code on `main`, and the actions it pins.** The key job runs this
   repository's code at the run's commit, the runner's own Node, and three
-  actions (`checkout`, `download-artifact`, `upload-artifact`) pinned by
-  commit. Whoever can change `main` or those pins can read the key. That is
+  actions (`checkout`, `download-artifact`) pinned by commit. Whoever can change `main` or those pins can read the key. That is
   the admin role, through the ruleset.
 - **GitHub.** Its secret store, its runners and its artifact storage are
   trusted; nothing here can check them.
@@ -330,10 +342,19 @@ still stands beside the key:
   that one kind, for that one second, under that kind's domains, and
   `publish` runs the specification's verifier again before anything reaches
   `data`. Such an attacker gains what a compromised service already has.
-  The signed artifact is readable by anyone for a day in this public
-  repository, so a document signed and then refused by `publish` can still
-  be fetched from there; the service and every client apply the same rules
-  to it and refuse it the same way.
+  The signatures leave the key job as a job output, not as an artifact, so
+  a document signed and then refused by `publish` is not published
+  anywhere.
+- **Artifact names are not isolated per kind.** Every job of a run can
+  upload an artifact under any name, so a taken-over `prepare` leg of one
+  kind could upload `prepared-<another kind>` before that kind's own leg
+  does (whose upload then fails, and the run goes red). The key job signs
+  an artifact only when its order names the job's own kind, so the key of
+  kind A is never used on an order for kind B; but within kind A it signs
+  what that artifact holds, like any `prepare` that was taken over (above).
+  Which job uploaded an artifact cannot be checked from the key job: the
+  artifact API needs a token and a connection, and the key job has
+  neither.
 - **Who can push `data`.** GitHub accepts no app as a ruleset's bypass
   actor on a repository owned by a personal account, so the ruleset that
   would let only the workflow write `data` cannot be set here

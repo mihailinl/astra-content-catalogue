@@ -10,8 +10,15 @@
 // <work> is the prepared artifact of this kind: the order, the two unsigned
 // bodies and trust.json (lib/workdir.mjs). It is admitted before anything in
 // it is read, and nothing else is read. <out> receives the result and, when
-// the kind is signed, the two signed documents; that directory is the job's
-// only output.
+// the kind is signed, the two signed documents, on this runner only: what
+// leaves the job is one line of job output, `<kind>=<result>` in
+// GITHUB_OUTPUT, the result and the two signatures (lib/workdir.mjs,
+// resultLine). No signed document becomes an artifact, which anyone could
+// download from a public repository before the publishing job checked it.
+//
+// The order's second is signed only when it is within the window of this
+// job's own clock (lib/workdir.mjs, assertOrderClock): the preparing job's
+// word for the time is not taken.
 //
 // It starts no process and opens no connection: nothing it imports can
 // (test/steps.test.mjs). The key arrives in the environment, never in an
@@ -21,11 +28,11 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { isMain, parseArgs, runAsCommand } from "../lib/args.mjs";
+import { appendTo, isMain, parseArgs, runAsCommand } from "../lib/args.mjs";
 import { signPrepared } from "../lib/keystep.mjs";
 import { assertKind, Refused } from "../lib/kinds.mjs";
 import { loadTrust } from "../lib/trust.mjs";
-import { admitPrepared, RESULT_SCHEMA, writeJson } from "../lib/workdir.mjs";
+import { admitPrepared, RESULT_SCHEMA, resultLine, writeJson } from "../lib/workdir.mjs";
 
 export function main(argv, { env = process.env, now = Math.floor(Date.now() / 1000), roots, log = console.log } = {}) {
   const args = parseArgs(argv, ["kind", "work", "out"]);
@@ -35,7 +42,8 @@ export function main(argv, { env = process.env, now = Math.floor(Date.now() / 10
   try {
     const order = admitPrepared(args.work, kind);
     const trust = order.outcome === "prepared" ? loadTrust({ file: path.join(args.work, "trust.json"), now, ...(roots ? { roots } : {}) }) : null;
-    const result = signPrepared({ kind, workDir: args.work, outDir: args.out, trust, secret });
+    const result = signPrepared({ kind, workDir: args.work, outDir: args.out, trust, secret, now });
+    appendTo("GITHUB_OUTPUT", `${kind}=${resultLine(args.out, kind)}`, env);
     if (result.outcome === "signed") log(`${kind}: signed with ${result.key_id}`);
     else if (result.outcome === "unchanged") log(`${kind}: unchanged; not signed again`);
     else if (result.outcome === "closed") log(`${kind}: service door not open`);
@@ -51,6 +59,7 @@ export function main(argv, { env = process.env, now = Math.floor(Date.now() / 10
     fs.mkdirSync(args.out, { recursive: true });
     for (const name of fs.readdirSync(args.out)) fs.rmSync(path.join(args.out, name), { recursive: true });
     writeJson(path.join(args.out, "result.json"), { schema: RESULT_SCHEMA, kind, outcome: "refused", code: e.code });
+    appendTo("GITHUB_OUTPUT", `${kind}=${resultLine(args.out, kind)}`, env);
     log(`${kind}: not signed (${e.line()}); the last signed documents stay`);
     return 1;
   }

@@ -9,7 +9,14 @@
 // then write the kind's three files into the data directory
 // (lib/pipeline.mjs, verifyAndInstall). No key, no token.
 //
-//   node bin/verify.mjs --kind <kind> --work <prepared artifact> --signed <signed artifact> --data <dir> --trust <trust.json>
+//   SIGNED_RESULT=<the key job's output for the kind> \
+//   node bin/verify.mjs --kind <kind> --work <prepared artifact> --signed <dir> --data <dir> --trust <trust.json>
+//
+// The key job hands on one line of job output, not an artifact. <signed> is
+// rebuilt from it and the prepared bodies (lib/workdir.mjs, signedFromLine)
+// and then checked as if the key job had written it. The order's second must
+// be within the window of this job's own clock and later than the serial of
+// the pair this job verified on `data`.
 //
 // It leaves <signed>/report.json for the publishing step:
 //   signed        the three files are in the data directory; `carried`
@@ -29,6 +36,7 @@ import { assertKind, Refused } from "../lib/kinds.mjs";
 import { verifyAndInstall } from "../lib/pipeline.mjs";
 import { loadRecovery } from "../lib/recovery.mjs";
 import { loadTrust } from "../lib/trust.mjs";
+import { signedFromLine } from "../lib/workdir.mjs";
 
 export const REPORT_SCHEMA = "astra.content.signer-report/1";
 
@@ -37,7 +45,9 @@ export function main(argv, { env = process.env, now = Math.floor(Date.now() / 10
   const kind = assertKind(args.kind);
   try {
     const trust = loadTrust({ file: args.trust, now, ...(roots ? { roots } : {}) });
+    signedFromLine(env.SIGNED_RESULT ?? "", args.work, args.signed, kind);
     const report = verifyAndInstall({
+      now,
       kind,
       workDir: args.work,
       signedDir: args.signed,

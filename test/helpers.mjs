@@ -119,8 +119,8 @@ export function signKind({ kind, exportFile, dataDir, trust, secret, now, tmpDir
   const signedDir = path.join(base, "signed");
   try {
     prepareKind({ kind, exportFile, dataDir, trust, now, workDir, everHeld, accepted });
-    signPrepared({ kind, workDir, outDir: signedDir, trust, secret });
-    return verifyAndInstall({ kind, workDir, signedDir, dataDir, trust, everHeld, accepted, ...(verify ? { verify } : {}), ...(check ? { check } : {}) });
+    signPrepared({ kind, workDir, outDir: signedDir, trust, secret, now });
+    return verifyAndInstall({ kind, workDir, signedDir, dataDir, trust, everHeld, now, accepted, ...(verify ? { verify } : {}), ...(check ? { check } : {}) });
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }
