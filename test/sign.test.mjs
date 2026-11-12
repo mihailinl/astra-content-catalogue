@@ -59,6 +59,35 @@ test("a golden round trip: the signer reproduces every valid golden, and the ven
   }
 });
 
+test("an entry without a thumbnail is signed for four kinds, and refused for packs", (t) => {
+  // AstraPlugins #177: the thumbnail is optional for commands, characters, models and animsets
+  // (the member is absent, never null) and stays required for packs.
+  const { trust } = goldenTrust();
+  for (const kind of ["commands", "characters", "models", "animsets"]) {
+    const want = golden(`index/${kind}/no-thumbnail.json`);
+    assert.ok(want.signed.entries.length > 0 && want.signed.entries.every((e) => !("thumbnail" in e)), kind);
+    const dir = scratch(t, kind);
+    const report = run(t, { dir, kind, export: exportOf(kind, { entries: want.signed.entries }), trust, secret: seedSecret(testSeed(`astra-${kind}-2026a`)) });
+    assert.equal(report.outcome, "signed", kind);
+    const got = read(path.join(dir, "data"), kind, "index");
+    assert.deepEqual(got.signed.entries, want.signed.entries, kind);
+    assert.deepEqual(got.signatures, want.signatures, `${kind}: the golden's own signature`);
+  }
+  const refused = (kind, entries, where) => {
+    const dir = scratch(t);
+    assert.throws(
+      () => run(t, { dir, kind, export: exportOf(kind, { entries }), trust, secret: seedSecret(testSeed(`astra-${kind}-2026a`)) }),
+      (e) => e instanceof Refused && e.code === "E_DOCUMENT_REFUSED" && e.where === where,
+      `${kind}: ${where}`,
+    );
+    assert.deepEqual(snapshot(path.join(dir, "data")), {});
+  };
+  refused("packs", golden("index/packs/no-thumbnail.json").signed.entries, "index/schema//signed/entries/0");
+  refused("commands", golden("index/commands/thumbnail-null.json").signed.entries, "index/schema//signed/entries/0/thumbnail");
+  // and a pack with its thumbnail is signed as before
+  assert.equal(run(t, { kind: "packs", export: exportOf("packs", { entries: golden("index/packs/valid.json").signed.entries }), trust, secret: seedSecret(testSeed("astra-packs-2026a")) }).outcome, "signed");
+});
+
 test("the published bytes are canonical JSON and the same for the same input", (t) => {
   const { trust, seeds } = throwawayTrust();
   const entries = golden("index/commands/valid.json").signed.entries;
