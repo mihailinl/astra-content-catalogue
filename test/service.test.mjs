@@ -13,7 +13,7 @@ import { main as fetchMain } from "../bin/fetch.mjs";
 import { KINDS } from "../lib/kinds.mjs";
 import { CLOSED_MAX_AGE, MAX_EXPORT_BYTES } from "../lib/kinds.mjs";
 import { AUDIENCE, fetchAll, SERVICE_BASE } from "../lib/service.mjs";
-import { exportOf, NOW, plant, scratch, throwawayTrust } from "./helpers.mjs";
+import { commitData, exportOf, NOW, plant, scratch, throwawayTrust } from "./helpers.mjs";
 
 const ENV = { ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.invalid/token?v=1", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "request-token" };
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -82,31 +82,51 @@ test("a door that stays shut fails the run for a kind published more than twelve
   put("models", 600);
   put("animsets", 86400 * 3);
   fs.writeFileSync(path.join(data, "registry", "v1", "animsets", "withdrawn.json"), "{"); // published, and unreadable
+  commitData(data, "four kinds"); // whether a kind was ever published is read from the branch's history
   // packs: never published. The door answers for models only.
   const { impl } = fakeFetch((kind) => (kind === "models" ? json(200, exportOf(kind)) : new Response("", { status: 404 })));
-  const out = scratch(t);
-  const outputs = path.join(out, "outputs");
-  const lines = [];
-  const work = await fetchMain(["--out", out, "--data", data], { env: { ...ENV, GITHUB_OUTPUT: outputs }, fetchImpl: impl, log: (l) => lines.push(l), now: NOW });
-  assert.deepEqual(work.kinds, { commands: "overdue", characters: "closed", models: "fetched", animsets: "overdue", packs: "closed" });
-  assert.equal(fs.readFileSync(outputs, "utf8"), "todo=true\nfailed=true\n", "the run fails, and the kind that was answered is still handed on");
-  assert.ok(lines.some((l) => l.startsWith("commands: service door not open (HTTP 404) and the kind was last signed 43201 s ago")));
+  const ask = async (fetchImpl) => {
+    const out = scratch(t);
+    const outputs = path.join(out, "outputs");
+    const lines = [];
+    const work = await fetchMain(["--out", out, "--data", data], { env: { ...ENV, GITHUB_OUTPUT: outputs }, fetchImpl, log: (l) => lines.push(l), now: NOW });
+    return { kinds: work.kinds, outputs: fs.readFileSync(outputs, "utf8"), lines };
+  };
+  const first = await ask(impl);
+  assert.deepEqual(first.kinds, { commands: "overdue", characters: "closed", models: "fetched", animsets: "overdue", packs: "closed" });
+  assert.equal(first.outputs, "todo=true\nfailed=true\n", "the run fails, and the kind that was answered is still handed on");
+  assert.ok(first.lines.some((l) => l.startsWith("commands: service door not open (HTTP 404) and the kind was last signed 43201 s ago")));
 
-  // only kinds inside the twelve hours or never published: quiet
+  const closed = fakeFetch(() => new Response("", { status: 404 })).impl;
+  // inside the twelve hours again, and animsets' unreadable file mended: quiet
   put("commands", 3600);
+  put("animsets", 3600);
+  commitData(data, "mended");
+  const quiet = await ask(closed);
+  assert.deepEqual(Object.values(quiet.kinds), KINDS.map(() => "closed"));
+  assert.equal(quiet.outputs, "todo=false\nfailed=false\n");
+
+  // a kind whose files were removed was still published: history says so, and the run fails
   fs.rmSync(path.join(data, "registry", "v1", "animsets"), { recursive: true });
   fs.rmSync(path.join(data, "state", "animsets.json"));
-  const closed = fakeFetch(() => new Response("", { status: 404 }));
-  const out2 = scratch(t);
-  const work2 = await fetchMain(["--out", out2, "--data", data], { env: { ...ENV, GITHUB_OUTPUT: path.join(out2, "outputs") }, fetchImpl: closed.impl, log: () => {}, now: NOW });
-  assert.deepEqual(Object.values(work2.kinds), KINDS.map(() => "closed"));
-  assert.equal(fs.readFileSync(path.join(out2, "outputs"), "utf8"), "todo=false\nfailed=false\n");
+  commitData(data, "remove animsets");
+  const removed = await ask(closed);
+  assert.equal(removed.kinds.animsets, "overdue");
+  assert.ok(removed.lines.some((l) => l.startsWith("animsets: service door not open (HTTP 404) and the kind was last signed at a time that cannot be read")));
+  assert.equal(removed.outputs, "todo=false\nfailed=true\n");
+
+  // a last signature dated in the future is overdue, not fresh
+  put("characters", -600);
+  commitData(data, "from the future");
+  const future = await ask(closed);
+  assert.equal(future.kinds.characters, "overdue");
+  assert.ok(future.lines.some((l) => l.startsWith("characters: service door not open (HTTP 404) and the kind was last signed at a time in the future")));
+
   // a kind with a state file and no documents was published too
   fs.mkdirSync(path.join(data, "state"), { recursive: true });
   fs.writeFileSync(path.join(data, "state", "packs.json"), "{}");
-  const out3 = scratch(t);
-  const work3 = await fetchMain(["--out", out3, "--data", data], { env: { ...ENV, GITHUB_OUTPUT: path.join(out3, "outputs") }, fetchImpl: closed.impl, log: () => {}, now: NOW });
-  assert.equal(work3.kinds.packs, "overdue");
+  commitData(data, "packs state");
+  assert.equal((await ask(closed)).kinds.packs, "overdue");
 });
 
 test("a refused call fails the run and still hands on the kinds that were answered", async (t) => {
@@ -126,6 +146,30 @@ test("a refused call fails the run and still hands on the kinds that were answer
   // no token is ever written to the log or to the files
   const everything = lines.join("\n") + fs.readdirSync(out).map((f) => fs.readFileSync(path.join(out, f), "utf8")).join("\n");
   assert.ok(!/token-\d|request-token/.test(everything));
+});
+
+test("an answer becomes an artifact only after it is checked: a refused one is never written where the upload reads", async (t) => {
+  const bad = {
+    // a member the export schema does not name (an account fact, say)
+    commands: (k) => json(200, { ...exportOf(k), moderator: "someone" }),
+    // an entry the kind's index schema refuses
+    characters: (k) => json(200, exportOf(k, { entries: [{ id: "x" }] })),
+    // stale: generated an hour before the run
+    models: (k) => json(200, exportOf(k, { at: NOW - 3600 })),
+    // not JSON
+    animsets: () => new Response("{", { status: 200, headers: { "content-type": "application/json" } }),
+  };
+  const { impl } = fakeFetch((kind) => (bad[kind] ? bad[kind](kind) : json(200, exportOf(kind))));
+  const out = scratch(t);
+  const outputs = path.join(out, "outputs");
+  const lines = [];
+  const work = await fetchMain(["--out", out, "--data", scratch(t, "data")], { env: { ...ENV, GITHUB_OUTPUT: outputs }, fetchImpl: impl, log: (l) => lines.push(l), now: NOW });
+  assert.deepEqual(work.kinds, { commands: "refused", characters: "refused", models: "refused", animsets: "refused", packs: "fetched" });
+  assert.deepEqual(fs.readdirSync(out).sort(), ["export-packs.json", "outputs", "work.json"], "only the answer that passed is in the artifact's directory");
+  assert.equal(fs.readFileSync(outputs, "utf8"), "todo=true\nfailed=true\n");
+  for (const kind of Object.keys(bad)) assert.ok(lines.some((l) => l.startsWith(`${kind}: the answer is refused (E_`)), kind);
+  // and nothing the service chose is printed
+  assert.ok(!lines.join("\n").includes("moderator") && !lines.join("\n").includes("someone"));
 });
 
 test("a refused token is not offered four more times", async () => {
