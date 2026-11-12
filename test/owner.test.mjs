@@ -239,14 +239,25 @@ test("owner/secrets uploads no key until GitHub is set up as owner/create.sh set
   await refusedBy("the ruleset does not restrict updates", [], (gh) => gh.setState((st) => (ruleset(st, ADMINS).rules = [{ type: "deletion" }])), "no active ruleset restricts updates of main");
   await refusedBy("GitHub Actions may bypass it", [], (gh) => gh.setState((st) => ruleset(st, ADMINS).bypass_actors.push({ actor_id: 15368, actor_type: "Integration", bypass_mode: "always" })), "no active ruleset restricts updates of main");
   await refusedBy("the write role may bypass it", [], (gh) => gh.setState((st) => (ruleset(st, ADMINS).bypass_actors = [{ actor_id: 4, actor_type: "RepositoryRole", bypass_mode: "always" }])), "no active ruleset restricts updates of main");
+  // GitHub leaves out the bypass list for a gh that cannot administer the repository: refused, and told why, never read as "nobody"
+  await refusedBy("gh is not signed in as an administrator", [], (gh) => gh.setState((st) => (st.notAdmin = true)), "gh must be signed in as an administrator of the repository");
+  // a ruleset aimed at the default branch protects main only while main is the default branch
+  const atDefault = (st) => (ruleset(st, ADMINS).conditions.ref_name.include = ["~DEFAULT_BRANCH"]);
+  await refusedBy("the ruleset is aimed at a default branch that is not main", [], (gh) => gh.setState((st) => (atDefault(st), (st.defaultBranch = "dev"))), "no active ruleset restricts updates of main");
+  {
+    const gh = fakeGh(t);
+    gh.setState(atDefault);
+    assert.equal((await secrets(t, trust, [keysDir(t, trust)], gh)).code, 0, "~DEFAULT_BRANCH while main is the default branch");
+  }
 
   // the kind's environment: main and nothing else
-  await refusedBy("an environment that also deploys from dev", [], (gh) => gh.setState((st) => st.environments["publish-models"].policies.push({ name: "dev", type: "branch" })), "publish-models must deploy from main only");
-  await refusedBy("an environment that deploys from dev only", [], (gh) => gh.setState((st) => (st.environments["publish-models"].policies = [{ name: "dev", type: "branch" }])), "publish-models must deploy from main only");
-  await refusedBy("an environment with no branch named", [], (gh) => gh.setState((st) => (st.environments["publish-packs"].policies = [])), "publish-packs must deploy from main only");
+  await refusedBy("an environment that also deploys from dev", [], (gh) => gh.setState((st) => st.environments["publish-models"].policies.push({ name: "dev", type: "branch" })), "publish-models must deploy from the branch main only");
+  await refusedBy("an environment that deploys from dev only", [], (gh) => gh.setState((st) => (st.environments["publish-models"].policies = [{ name: "dev", type: "branch" }])), "publish-models must deploy from the branch main only");
+  await refusedBy("an environment whose one policy is a TAG named main", [], (gh) => gh.setState((st) => (st.environments["publish-models"].policies = [{ name: "main", type: "tag" }])), "publish-models must deploy from the branch main only");
+  await refusedBy("an environment with no branch named", [], (gh) => gh.setState((st) => (st.environments["publish-packs"].policies = [])), "publish-packs must deploy from the branch main only");
   await refusedBy("an environment open to every branch", [], (gh) => gh.setState((st) => (st.environments["publish-packs"].settings.deployment_branch_policy = null)), "publish-packs is not restricted to named branches");
   await refusedBy("an environment restricted to protected branches instead", [], (gh) => gh.setState((st) => (st.environments["publish-packs"].settings.deployment_branch_policy = { protected_branches: true, custom_branch_policies: false })), "publish-packs is not restricted to named branches");
-  await refusedBy("--rotate into an environment that also deploys from dev", ["--rotate", "models"], (gh) => gh.setState((st) => st.environments["publish-models"].policies.push({ name: "dev", type: "branch" })), "publish-models must deploy from main only");
+  await refusedBy("--rotate into an environment that also deploys from dev", ["--rotate", "models"], (gh) => gh.setState((st) => st.environments["publish-models"].policies.push({ name: "dev", type: "branch" })), "publish-models must deploy from the branch main only");
 
   // another repository, whatever it is called
   await refusedBy("another repository", ["--repo", "mihailinl/astra-content-catalogue-staging"], () => {}, "is not the signer's repository");
@@ -357,5 +368,12 @@ test("owner/create.sh: environments on main only, four rulesets, the two ids, an
   fs.writeFileSync(path.join(gh.bin, "state.json"), JSON.stringify(state));
   const r = spawnSync("bash", [path.join(ROOT, "owner", "create.sh")], { env: { PATH: gh.path, HOME: gh.bin }, encoding: "utf8" });
   assert.equal(r.status, 1);
-  assert.match(r.stderr, /environment publish-packs also allows: dev/);
+  assert.match(r.stderr, /environment publish-packs also allows: branch dev/);
+
+  // so does a TAG policy named main, which a check by name alone would take for the branch
+  state.environments["publish-packs"].policies = [{ name: "main", type: "branch" }, { name: "main", type: "tag" }];
+  fs.writeFileSync(path.join(gh.bin, "state.json"), JSON.stringify(state));
+  const tag = spawnSync("bash", [path.join(ROOT, "owner", "create.sh")], { env: { PATH: gh.path, HOME: gh.bin }, encoding: "utf8" });
+  assert.equal(tag.status, 1);
+  assert.match(tag.stderr, /environment publish-packs also allows: tag main/);
 });

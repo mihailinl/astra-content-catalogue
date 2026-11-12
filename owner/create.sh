@@ -53,14 +53,15 @@ environment() {
 {"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
 JSON
   local policies
-  policies="$(api "repos/$REPO/environments/$name/deployment-branch-policies" --jq '.branch_policies[].name')"
+  policies="$(api "repos/$REPO/environments/$name/deployment-branch-policies" --jq '.branch_policies[] | select(.type == "branch") | .name')"
   if ! grep -qx main <<<"$policies"; then
     api --method POST "repos/$REPO/environments/$name/deployment-branch-policies" --input - >/dev/null <<'JSON'
 {"name": "main", "type": "branch"}
 JSON
   fi
   local others
-  others="$(api "repos/$REPO/environments/$name/deployment-branch-policies" --jq '[.branch_policies[].name] | map(select(. != "main")) | join(" ")')"
+  # anything but the branch main, a TAG policy named main included
+  others="$(api "repos/$REPO/environments/$name/deployment-branch-policies" --jq '[.branch_policies[] | select(.name != "main" or .type != "branch") | "\(.type) \(.name)"] | join(", ")')"
   if [ -n "$others" ]; then
     echo "environment $name also allows: $others — remove them by hand; this script removes nothing" >&2
     exit 1

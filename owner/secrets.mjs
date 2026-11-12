@@ -31,11 +31,14 @@
 //   3. asks GitHub, for the repository and each kind asked for, and refuses
 //      unless ALL of this holds:
 //        - the repository's id is the compiled one;
-//        - the environment publish-<kind> deploys from `main` and from no
-//          other branch;
+//        - the environment publish-<kind> deploys from the branch `main`
+//          and from nothing else (a policy of type `tag` does not count);
 //        - an active ruleset restricts updates of `main` with nobody but the
 //          admin role as bypass (owner/create.sh sets it). Without it, code
-//          pushed to `main` by any writer would run beside the key;
+//          pushed to `main` by any writer would run beside the key. GitHub
+//          shows a ruleset's bypass list only to an administrator, so a gh
+//          signed in without that right is refused, and told so; a ruleset
+//          aimed at `~DEFAULT_BRANCH` counts only while that branch is `main`;
 //        - in a plain run: the kind's documents on `data` were not signed
 //          with its NEXT key. After `--rotate <kind>` and before the trust
 //          change, the environment holds the next key, and a plain run would
@@ -128,28 +131,40 @@ function ghJson(route, env) {
   return JSON.parse(r.stdout);
 }
 
-/** Why the repository's `main` is not protected as owner/create.sh sets it, or null. */
-export function mainRulesetProblem(repo, env) {
+/**
+ * Why the repository's `main` is not protected as owner/create.sh sets it, or null.
+ * `defaultBranch` is the repository's, so that a ruleset aimed at
+ * `~DEFAULT_BRANCH` counts only while that branch is `main`.
+ */
+export function mainRulesetProblem(repo, env, defaultBranch) {
+  let unseen = null;
   for (const brief of ghJson(`repos/${repo}/rulesets`, env)) {
     if (brief.target !== "branch" || brief.enforcement !== "active") continue;
     const rs = ghJson(`repos/${repo}/rulesets/${brief.id}`, env);
     const ref = rs.conditions?.ref_name ?? {};
-    const coversMain = (ref.include ?? []).some((r) => r === "refs/heads/main" || r === "~DEFAULT_BRANCH") && (ref.exclude ?? []).length === 0;
+    const coversMain = (ref.include ?? []).some((r) => r === "refs/heads/main" || (r === "~DEFAULT_BRANCH" && defaultBranch === "main")) && (ref.exclude ?? []).length === 0;
     const restrictsUpdate = (rs.rules ?? []).some((r) => r.type === "update");
-    const onlyAdmins = (rs.bypass_actors ?? []).every((a) => a.actor_type === "RepositoryRole" && a.actor_id === 5);
-    if (rs.enforcement === "active" && coversMain && restrictsUpdate && onlyAdmins) return null;
+    if (rs.target !== "branch" || rs.enforcement !== "active" || !coversMain || !restrictsUpdate) continue;
+    // GitHub leaves the bypass list out for a token that cannot administer the repository;
+    // an absent list is not an empty one, and nothing is concluded from it
+    if (!Array.isArray(rs.bypass_actors)) {
+      unseen = `GitHub did not show who may bypass ruleset ${brief.id} on main; gh must be signed in as an administrator of the repository`;
+      continue;
+    }
+    if (rs.bypass_actors.every((a) => a.actor_type === "RepositoryRole" && a.actor_id === 5)) return null;
   }
-  return "no active ruleset restricts updates of main to administrators (run owner/create.sh)";
+  return unseen ?? "no active ruleset restricts updates of main to administrators (run owner/create.sh)";
 }
 
-/** Why the kind's environment may be entered from a branch other than main, or null. */
+/** Why the kind's environment may be entered from anything but the branch `main`, or null. */
 export function environmentProblem(repo, kind, env) {
   const name = environmentOf(kind);
   const e = ghJson(`repos/${repo}/environments/${name}`, env);
   const p = e.deployment_branch_policy;
   if (!p || p.custom_branch_policies !== true || p.protected_branches !== false) return `${name} is not restricted to named branches (run owner/create.sh)`;
-  const names = (ghJson(`repos/${repo}/environments/${name}/deployment-branch-policies`, env).branch_policies ?? []).map((b) => b.name);
-  if (names.length !== 1 || names[0] !== "main") return `${name} must deploy from main only (run owner/create.sh)`;
+  const policies = ghJson(`repos/${repo}/environments/${name}/deployment-branch-policies`, env).branch_policies ?? [];
+  // a policy of type `tag` named main would admit a TAG called main, from which anybody with write access could deploy
+  if (policies.length !== 1 || policies[0].name !== "main" || policies[0].type !== "branch") return `${name} must deploy from the branch main only (run owner/create.sh)`;
   return null;
 }
 
@@ -201,9 +216,10 @@ export async function main(argv, { roots, fetchImpl = fetch, log = console.log, 
   }
   // what GitHub must look like before a key goes there
   const problems = [];
-  if (ghJson(`repos/${o.repo}`, env).id !== REPOSITORY_ID) problems.push(`${o.repo} is not the signer's repository (its id is not ${REPOSITORY_ID})`);
+  const repo = ghJson(`repos/${o.repo}`, env);
+  if (repo.id !== REPOSITORY_ID) problems.push(`${o.repo} is not the signer's repository (its id is not ${REPOSITORY_ID})`);
   else {
-    const rules = mainRulesetProblem(o.repo, env);
+    const rules = mainRulesetProblem(o.repo, env, repo.default_branch);
     if (rules) problems.push(rules);
     for (const f of found) {
       const e = environmentProblem(o.repo, f.kind, env);

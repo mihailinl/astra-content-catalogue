@@ -71,6 +71,11 @@ if (argv[0] === "api") {
   if ((m = /^repos\/([^/]+\/[^/]+)\/rulesets\/(\d+)$/.exec(route)) && method === "GET") {
     const r = state.rulesets.find((x) => x.id === Number(m[2]));
     if (!r) fail("no such ruleset");
+    // GitHub shows the bypass list only to a token that can administer the repository
+    if (state.notAdmin) {
+      const { bypass_actors, ...seen } = r;
+      done(JSON.stringify(seen));
+    }
     done(JSON.stringify(r));
   }
   if ((m = /^repos\/([^/]+\/[^/]+)\/environments\/([a-z-]+)$/.exec(route)) && method === "PUT") {
@@ -84,10 +89,11 @@ if (argv[0] === "api") {
       env.policies.push(body);
       done("{}");
     }
-    const names = env.policies.map((p) => p.name);
     if (jq === null) done(JSON.stringify({ total_count: env.policies.length, branch_policies: env.policies }));
-    if (jq === ".branch_policies[].name") done(names.join("\n"));
-    if (jq === '[.branch_policies[].name] | map(select(. != "main")) | join(" ")') done(names.filter((n) => n !== "main").join(" "));
+    if (jq === '.branch_policies[] | select(.type == "branch") | .name') done(env.policies.filter((p) => p.type === "branch").map((p) => p.name).join("\n"));
+    if (jq === '[.branch_policies[] | select(.name != "main" or .type != "branch") | "\\(.type) \\(.name)"] | join(", ")') {
+      done(env.policies.filter((p) => p.name !== "main" || p.type !== "branch").map((p) => `${p.type} ${p.name}`).join(", "));
+    }
     fail("an unmodelled --jq");
   }
   if ((m = /^repos\/([^/]+\/[^/]+)\/rulesets$/.exec(route))) {
@@ -108,7 +114,7 @@ if (argv[0] === "api") {
   }
   if ((m = /^repos\/([^/]+\/[^/]+)$/.exec(route)) && method === "GET") {
     const id = REPO_ID[m[1]] ?? 999;
-    if (jq === null) done(JSON.stringify({ id, owner: { id: 193032699 } }));
+    if (jq === null) done(JSON.stringify({ id, owner: { id: 193032699 }, default_branch: state.defaultBranch ?? "main" }));
     if (jq !== '"repository_id        \\(.id)\\nrepository_owner_id  \\(.owner.id)"') fail("an unmodelled --jq");
     done(`repository_id        ${id}\nrepository_owner_id  193032699`);
   }
