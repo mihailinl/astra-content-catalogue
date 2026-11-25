@@ -1,0 +1,8 @@
+{
+  "schema": "astra.content.signer-state/1",
+  "kind": "models",
+  "state_sha256": "9f0de125985b561d502b6a212c074571033a80046962930348f6d301dd92ab31",
+  "issued_at": 1795572515,
+  "key_id": "astra-models-2026a",
+  "carried": 0
+}
