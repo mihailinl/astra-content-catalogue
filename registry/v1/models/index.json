@@ -1,1 +1,1 @@
-{"signatures":[{"key_id":"astra-models-2026a","sig":"MIqlHYnn1BLhkawmnwkx1rjbrfNjAdrpRpUfaTMvMAPef4rCbIyzBEdiEwhmC+dJJqmu8SJnzfJM6SWlRMziDw=="}],"signed":{"entries":[],"expires_at":1796177315,"issued_at":1795572515,"schema":"astra.models.index/1","serial":1795572515}}
+{"signatures":[{"key_id":"astra-models-2026a","sig":"cJzXiKVGG7gF4UMsGNKlT6xqeaS87Y7LFjw2s3suBq+OVUzmQfZprnIkaF95pttiokA9kPmYU7d0doeCa/iGCw=="}],"signed":{"entries":[],"expires_at":1796221157,"issued_at":1795616357,"schema":"astra.models.index/1","serial":1795616357}}
