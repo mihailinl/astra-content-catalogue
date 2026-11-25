@@ -1,1 +1,1 @@
-{"signatures":[{"key_id":"astra-characters-2026a","sig":"XBZTbGYHuemz0VUaKtG3XyOvz4OE5IFb0gN842ayipyh0Gd9+B9CbpODw6j5jZvWUawKzjrAIaJCtscItcn9DQ=="}],"signed":{"expires_at":1796177322,"issued_at":1795572522,"lifts":[],"rows":[],"schema":"astra.characters.withdrawn/1","serial":1795572522}}
+{"signatures":[{"key_id":"astra-characters-2026a","sig":"wgFXdl52F1VdwRoCwVdYMRG+Hg54YOSd3WePu5xVVErZQF7dJGcsuiqed4N6asTBS8VGQ8I67PAs7EOYmfS1Bw=="}],"signed":{"expires_at":1796221144,"issued_at":1795616344,"lifts":[],"rows":[],"schema":"astra.characters.withdrawn/1","serial":1795616344}}
