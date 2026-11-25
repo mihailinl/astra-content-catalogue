@@ -1,1 +1,1 @@
-{"signatures":[{"key_id":"astra-animsets-2026a","sig":"IA8OoV1uTUuasZS/BDe7ziGMs8MfCVri/CAfdtYlR7QnI0RdhojYKQuVHSIUYfnXIg6nclItgGHW216EWJQ5CA=="}],"signed":{"expires_at":1796177320,"issued_at":1795572520,"lifts":[],"rows":[],"schema":"astra.animsets.withdrawn/1","serial":1795572520}}
+{"signatures":[{"key_id":"astra-animsets-2026a","sig":"6s28xNaDZ/msWiqjH2Dd7kcp9dWPH0qCBhctjk+lLjlQqoz7a8lC0q7r/Y+3J11OLSuZxEtvecrn+GjCcSQ0Cw=="}],"signed":{"expires_at":1796221143,"issued_at":1795616343,"lifts":[],"rows":[],"schema":"astra.animsets.withdrawn/1","serial":1795616343}}
