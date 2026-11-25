@@ -1,0 +1,8 @@
+{
+  "schema": "astra.content.signer-state/1",
+  "kind": "characters",
+  "state_sha256": "b631f1d1e3e413e85527fcf9d2c0f510d37580ae8495b503af825a20c70c1a30",
+  "issued_at": 1795572522,
+  "key_id": "astra-characters-2026a",
+  "carried": 0
+}
