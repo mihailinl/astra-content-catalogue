@@ -2,7 +2,7 @@
   "schema": "astra.content.signer-state/1",
   "kind": "packs",
   "state_sha256": "5cc13b0387b50f13a5f1ca159ab6faaf23c7f31f689397406bd85ce642c322ad",
-  "issued_at": 1795706107,
+  "issued_at": 1795737294,
   "key_id": "astra-packs-2026a",
   "carried": 0
 }
