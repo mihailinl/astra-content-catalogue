@@ -2,7 +2,7 @@
   "schema": "astra.content.signer-state/1",
   "kind": "commands",
   "state_sha256": "ad423d7300dbe512b72f2148bc8d83b9544e8a36213a950c9e85b5593a990f28",
-  "issued_at": 1795648243,
+  "issued_at": 1795706107,
   "key_id": "astra-commands-2026a",
   "carried": 0
 }
