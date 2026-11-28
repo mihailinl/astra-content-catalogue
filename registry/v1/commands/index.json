@@ -1,1 +1,1 @@
-{"signatures":[{"key_id":"astra-commands-2026a","sig":"a+nKkJigUf5j4MbWOuqVuM4QUBpx+DyBcwJG889tC1I5ypFcdlkVY5i4hbTnxTYbJQrd8Zp1AoReU6dETb0hBQ=="}],"signed":{"entries":[],"expires_at":1796430904,"issued_at":1795826104,"schema":"astra.commands.index/1","serial":1795826104}}
+{"signatures":[{"key_id":"astra-commands-2026a","sig":"Grp4BQBwdLF4F/wY/Mwwa1Xd8toKa6tlBvHDhfI/ss1Z6UQad7vbiqQJwByAnJHd35j6VNxBQxgCtMOuYL1hBg=="}],"signed":{"entries":[],"expires_at":1796459145,"issued_at":1795854345,"schema":"astra.commands.index/1","serial":1795854345}}
